@@ -132,31 +132,71 @@ python -m unittest test_checks        # proves those 15 checks aren't vacuous
 > and "a vacuous check also prints 过" is exactly the disease recorded in the table at the top of that file.
 > Skipping (rather than faking a pass) is how this report **states honestly how far it actually verified**.
 
-> ⚠️ **Do not redirect `test_checks` output to a file** (`> log.txt`, `| tee`, `| head`).
+> ⚠️ **`test_checks` used to have one test that went red intermittently. It is fixed.**
 >
-> This was found the hard way: `test_checks` writes temporary probes into the repo and removes them
-> in a `finally` block. Once the output is piped or redirected, that cleanup gets interrupted — the
-> probes stay behind, and the next run's `Test00NoResidueAtStart` reports "the previous run was
-> interrupted", **which looks like a broken check**.
+> The symptom: red on the first run, green on the second.
 >
-> Measured, same fresh clone:
->
-> | How you run it | Result |
-> |---|---|
-> | `python -m unittest test_checks` | `OK (skipped=7)` |
-> | `python -m unittest test_checks > log.txt` | `FAILED (failures=1, skipped=7)` |
->
-> **If you want a record, run it again and read the last three lines in the terminal** — don't pipe.
-> If you do hit it, clean up and re-run:
->
-> ```bash
-> rm -f _tmp_probe_zzz.py samples/_tmp_probe_zzz.md
-> rm -f __pycache__/_tmp_probe_zzz.*.pyc
+> ```
+> run 1:  FAILED (failures=1, skipped=7)
+> run 2:  OK (skipped=7)
 > ```
 >
-> Why not simply fix it: **this behaviour is one of the things being protected** —
-> "residue and a broken check look identical". The tests would rather cry wolf once
-> than silently swallow residue.
+> The report was `Test00NoResidueAtStart`: "residue before the run started:
+> `_tmp_probe_zzz.py` — the previous run was interrupted".
+>
+> **Root cause** (measured, not guessed): `test_checks` writes temporary probes into the repo and
+> removes them in a `finally` block. A `finally` block only runs if **the process reaches its
+> cleanup**. Three ways to run it, measured:
+>
+> | How you run it | Residue afterwards |
+> |---|---|
+> | Normal run | none |
+> | Redirected to a file, `> log.txt` | **none** |
+> | **SIGKILLed part-way through** | **yes** |
+>
+> In other words: **re-running and redirecting are both harmless.**
+> Only `SIGKILL` leaves residue — and that means `Ctrl-C`, a cancelled task, a killed process,
+> the machine sleeping. It gives Python no chance to run `finally`, so if the window between
+> "probe written" and "cleanup run" gets hit, the probe stays on disk and the *next* run's first
+> test goes red.
+>
+> **The old implementation was a misattribution**: `assertEqual(left, [], ...)` judged *this* run
+> using *the previous run's accident*, and the message "the previous run was interrupted" reads as
+> "this repo's tests are broken" — while pointing at a completely different test.
+> Cleanup was never the problem: residue is always healed by the next run's `_clean_probes()`.
+>
+> **The current implementation**:
+>
+> ```python
+> left = sorted(str(p.resolve()) for p in ROOT.rglob("_tmp_probe*"))
+> if not left:
+>     return
+> _clean_probes()          # heal: remove what the previous hard kill left behind
+> self.skipTest(f"previous run was hard-killed, left {len(left)} probe residue, "
+>               f"cleaned up automatically: {left} — not a failure of this run.")
+> ```
+>
+> The two residue checks deliberately behave **differently** — the difference is **whose accident
+> it is**:
+>
+> | Test | Covers | On residue |
+> |---|---|---|
+> | `Test00NoResidueAtStart` | left by the *previous* run | heal + `skipTest` (the previous run's accident) |
+> | `TestNoResidue` | left by *this* run | **fail** (this run really did not clean up) |
+>
+> `TestNoResidue` **still fails**: if it gets to run at all, this run's `finally` blocks have all
+> executed. Residue under those conditions can only mean `_clean_probes()` missed a path —
+> **that is this run's bug, and it must fail.**
+>
+> This is the same shape as `_need()`: when an upstream file is absent, `skipTest` with a reason
+> rather than fail — because what gets reported is "the check is broken" while the real cause is
+> "the target file is not here". "The previous run's accident" and "this run's failure" **must be
+> reported separately**, or the repo cannot honestly state what it verified.
+>
+> ✅ Measured: three consecutive clean runs all green; with one residue planted, output is
+> `OK (skipped=8)` (the extra skip *is* the healing path, and it prints the absolute path —
+> **visible, but not fatal**); running `TestNoResidue` directly with residue planted still
+> **fails**. **You no longer need to worry about this red, and no manual `rm` is needed.**
 
 ## One-way, in a few lines
 
