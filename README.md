@@ -132,6 +132,30 @@ python -m unittest test_checks        # 证明那 15 条检查不是空转
 > 而「空转的检查也在打印『过』」正是这个文件开头记着的那张表里的病。
 > 跳过（而不是假装通过）是这份报告**如实说出自己验到哪**的方式。
 
+> ⚠️ **不要把 `test_checks` 的输出重定向到文件**（`> log.txt`、`| tee`、`| head`）。
+>
+> 这条是**实测**踩出来的：`test_checks` 会往仓库里写临时探针、跑完在 `finally` 里删掉。
+> 输出一旦接管道或被重定向，收尾的清理动作会被打断 —— 探针留下，
+> 下一轮开跑时 `Test00NoResidueAtStart` 报「上一轮被打断了」，**看起来像检查坏了**。
+>
+> 实测对照（同一个全新克隆）：
+>
+> | 跑法 | 结果 |
+> |---|---|
+> | `python -m unittest test_checks` | `OK (skipped=7)` |
+> | `python -m unittest test_checks > log.txt` | `FAILED (failures=1, skipped=7)` |
+>
+> **要留证据就重跑一次、看终端的最后三行** —— 而不是接管道。
+> 真要是撞上了，清掉再跑就好：
+>
+> ```bash
+> rm -f _tmp_probe_zzz.py samples/_tmp_probe_zzz.md
+> rm -f __pycache__/_tmp_probe_zzz.*.pyc
+> ```
+>
+> 之所以不「修好它」：**这一条本身就是被保护的行为之一** ——
+> 「残留和检查失效长得一模一样」。测试宁可误报一次，也不肯静默地把残留咽下去。
+
 ## 几行看懂单向性
 
 ```python

@@ -132,6 +132,32 @@ python -m unittest test_checks        # proves those 15 checks aren't vacuous
 > and "a vacuous check also prints 过" is exactly the disease recorded in the table at the top of that file.
 > Skipping (rather than faking a pass) is how this report **states honestly how far it actually verified**.
 
+> ⚠️ **Do not redirect `test_checks` output to a file** (`> log.txt`, `| tee`, `| head`).
+>
+> This was found the hard way: `test_checks` writes temporary probes into the repo and removes them
+> in a `finally` block. Once the output is piped or redirected, that cleanup gets interrupted — the
+> probes stay behind, and the next run's `Test00NoResidueAtStart` reports "the previous run was
+> interrupted", **which looks like a broken check**.
+>
+> Measured, same fresh clone:
+>
+> | How you run it | Result |
+> |---|---|
+> | `python -m unittest test_checks` | `OK (skipped=7)` |
+> | `python -m unittest test_checks > log.txt` | `FAILED (failures=1, skipped=7)` |
+>
+> **If you want a record, run it again and read the last three lines in the terminal** — don't pipe.
+> If you do hit it, clean up and re-run:
+>
+> ```bash
+> rm -f _tmp_probe_zzz.py samples/_tmp_probe_zzz.md
+> rm -f __pycache__/_tmp_probe_zzz.*.pyc
+> ```
+>
+> Why not simply fix it: **this behaviour is one of the things being protected** —
+> "residue and a broken check look identical". The tests would rather cry wolf once
+> than silently swallow residue.
+
 ## One-way, in a few lines
 
 ```python
