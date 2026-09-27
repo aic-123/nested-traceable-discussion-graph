@@ -132,71 +132,37 @@ python -m unittest test_checks        # proves those 15 checks aren't vacuous
 > and "a vacuous check also prints 过" is exactly the disease recorded in the table at the top of that file.
 > Skipping (rather than faking a pass) is how this report **states honestly how far it actually verified**.
 
-> ⚠️ **`test_checks` used to have one test that went red intermittently. It is fixed.**
+> **Two "report hygiene" checks — one plugs a false green, the other a false red.**
 >
-> The symptom: red on the first run, green on the second.
+> `test_checks` writes temporary probes into the repo and removes them in a `finally` block.
+> So there is a state where **a probe is left behind but every check in this run passed.**
 >
-> ```
-> run 1:  FAILED (failures=1, skipped=7)
-> run 2:  OK (skipped=7)
-> ```
->
-> The report was `Test00NoResidueAtStart`: "residue before the run started:
-> `_tmp_probe_zzz.py` — the previous run was interrupted".
->
-> **Root cause** (measured, not guessed): `test_checks` writes temporary probes into the repo and
-> removes them in a `finally` block. A `finally` block only runs if **the process reaches its
-> cleanup**. Three ways to run it, measured:
->
-> | How you run it | Residue afterwards |
-> |---|---|
-> | Normal run | none |
-> | Redirected to a file, `> log.txt` | **none** |
-> | **SIGKILLed part-way through** | **yes** |
->
-> In other words: **re-running and redirecting are both harmless.**
-> Only `SIGKILL` leaves residue — and that means `Ctrl-C`, a cancelled task, a killed process,
-> the machine sleeping. It gives Python no chance to run `finally`, so if the window between
-> "probe written" and "cleanup run" gets hit, the probe stays on disk and the *next* run's first
-> test goes red.
->
-> **The old implementation was a misattribution**: `assertEqual(left, [], ...)` judged *this* run
-> using *the previous run's accident*, and the message "the previous run was interrupted" reads as
-> "this repo's tests are broken" — while pointing at a completely different test.
-> Cleanup was never the problem: residue is always healed by the next run's `_clean_probes()`.
->
-> **The current implementation**:
->
-> ```python
-> left = sorted(str(p.resolve()) for p in ROOT.rglob("_tmp_probe*"))
-> if not left:
->     return
-> _clean_probes()          # heal: remove what the previous hard kill left behind
-> self.skipTest(f"previous run was hard-killed, left {len(left)} probe residue, "
->               f"cleaned up automatically: {left} — not a failure of this run.")
-> ```
->
-> The two residue checks deliberately behave **differently** — the difference is **whose accident
-> it is**:
+> What should be reported then? Reporting "pass" lets the residue contaminate the next run;
+> reporting "fail" judges this run by the previous run's accident. This repo's answer is
+> **attribute separately, and say either one out loud**:
 >
 > | Test | Covers | On residue |
 > |---|---|---|
-> | `Test00NoResidueAtStart` | left by the *previous* run | heal + `skipTest` (the previous run's accident) |
-> | `TestNoResidue` | left by *this* run | **fail** (this run really did not clean up) |
+> | `Test00NoResidueAtStart` | left by the **previous** run | clean up + `skipTest`, message carries the absolute path |
+> | `TestNoResidue` | left by **this** run | **fail** — all cleanup ran, so residue means a path was missed |
 >
-> `TestNoResidue` **still fails**: if it gets to run at all, this run's `finally` blocks have all
-> executed. Residue under those conditions can only mean `_clean_probes()` missed a path —
-> **that is this run's bug, and it must fail.**
+> The criterion is not "how strict" — it is **whose accident it is**.
 >
-> This is the same shape as `_need()`: when an upstream file is absent, `skipTest` with a reason
-> rather than fail — because what gets reported is "the check is broken" while the real cause is
-> "the target file is not here". "The previous run's accident" and "this run's failure" **must be
-> reported separately**, or the repo cannot honestly state what it verified.
+> ```
+> residue before run: ['_tmp_probe_zzz.py']
+> this run:           OK (skipped=8)   <- self-healed; absolute path in the message — visible, but not fatal
+> residue after run:  []
+> run again:          OK (skipped=7)
+> ```
 >
-> ✅ Measured: three consecutive clean runs all green; with one residue planted, output is
-> `OK (skipped=8)` (the extra skip *is* the healing path, and it prints the absolute path —
-> **visible, but not fatal**); running `TestNoResidue` directly with residue planted still
-> **fails**. **You no longer need to worry about this red, and no manual `rm` is needed.**
+> The only thing that can leave residue is `SIGKILL` (`Ctrl-C` / a killed process /
+> the machine sleeping) — a `finally` block only runs if the process reaches its cleanup.
+> **Re-running and redirecting output are both harmless.** So you never need to `rm` by hand,
+> and you will not mistake this for a broken check.
+>
+> Reverse acceptance criterion (verify this whenever you touch these checks):
+> **running `TestNoResidue` directly with residue planted must still `FAIL`** —
+> letting the previous run's accident self-heal must not soften this run's missed cleanup.
 
 ## One-way, in a few lines
 
