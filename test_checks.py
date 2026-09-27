@@ -135,24 +135,57 @@ class Test00NoResidueAtStart(unittest.TestCase):
     中间的 helper 一律 `_clean_probes()` 自愈，不再各自断言。
 
     这和本仓库一直在防的那类病是同一个：**残留和检查失效长得一模一样**。
+
+    ⚠️ 2026-09-27 补：本类**不再判红**，改成「自愈 + skip 说明」。
+    原因是残留的成因被查清了 —— 它是**上一轮进程被硬终止**（`SIGKILL` 不给
+    `finally` 机会），跟这一轮的代码质量无关。判红等于把上一轮的事故
+    记到这一轮头上，而报出来的地方又指向另一条用例。详见本类方法的 docstring。
     """
 
     def test_no_residue_before_the_run_starts(self):
+        """跑前有残留 → **自愈 + 说明**，不是判 FAIL。
+
+        为什么这里**不能**断言（2026-09-27 实测定案）：
+
+        残留的唯一成因是「**上一个进程在探针存在于磁盘上的那个窗口里被硬终止**」。
+        实测三种运行方式：
+
+            | 运行方式 | 跑完残留 |
+            |---|---|
+            | 正常跑 / 重定向到文件 | 无 |
+            | stdout 接管道后提前关闭（`| head -5`） | 无 |
+            | **跑到一半被 SIGKILL** | **有** |
+
+        也就是说 `finally: _clean_probes()` 是好的 —— 它**只在进程能跑到收尾时**生效。
+        `SIGKILL` / 硬终止**不给 Python 执行 `finally` 的机会**，
+        这正是「Ctrl-C 打断了一次跑，下一次开跑就红」的机制。
+
+        ⚠️ 所以把这条报成 FAIL 是**归因错误**：它拿**上一轮的事故**判**这一轮**不合格。
+        而失败信息里那句「上一轮被打断了」会被读成「你的测试有 bug」，
+        于是照着 `rm` 去清 —— 而清理从来不是问题（残留必然在下一轮被自愈）。
+
+        改成 skip 之后：
+        - 无残留 → 不产生多余 skip（不吵）
+        - 有残留 → 产生 1 个 skip，说明里**带绝对路径**（可见，不是静默）
+        - 结论行仍在（报告有结论）
+
+        这与本仓库一直在守的那条一致：**「上一轮的事故」和「这一轮的失败」
+        必须分开报** —— 就像缺上游文件时 `skipTest` 而不是判红。
+        """
         # 报**绝对路径**，不报 `p.name` —— `rglob` 是递归的，只给文件名的话
         # 看不出残留在哪个目录，等于没报。
         left = sorted(str(p.resolve()) for p in ROOT.rglob("_tmp_probe*"))
-        self.assertEqual(
-            left, [],
-            f"开跑前就有残留：{left} —— 上一轮被打断了"
-            f"（管道提前关闭 / Ctrl-C / 进程被杀）。"
-            # ⚠️ 这句必须把 `__pycache__` 说出来。2026-09-25 实测：
-            # 探针 `.py` 被 `compileall` 编译过一次之后，残留物是
-            # `__pycache__/_tmp_probe_zzz.cpython-3xx.pyc` —— 而
-            # `rm -f _tmp_probe_zzz.py` **删不到它**。旧文案只说「删掉再跑」，
-            # 于是照着做的人会卡在「删了还是红」的循环里。
-            "清掉再跑：`rm -f _tmp_probe_zzz.py samples/_tmp_probe_zzz.md`"
-            " **以及** `rm -f __pycache__/_tmp_probe_zzz.*.pyc`"
-            "（探针被编译过的话，残留物是那个 .pyc）。",
+        if not left:
+            return
+        # 自愈：清掉上一轮硬终止留下的东西（含 `__pycache__` 里的 `.pyc` ——
+        # `rglob` 是递归的，所以 `_clean_probes()` 一次就能扫干净）。
+        _clean_probes()
+        self.skipTest(
+            f"上一轮被硬终止，留下 {len(left)} 个探针残留，已自动清理：{left}"
+            " —— 这不是本轮的失败。"
+            "成因是「进程在探针存在于磁盘的窗口里被硬终止」"
+            "（Ctrl-C / 进程被杀 / 机器休眠），`finally` 来不及跑。"
+            "下一次开跑会自动清掉，不需要手工 `rm`。"
         )
 
 
@@ -666,6 +699,19 @@ class TestNoResidue(unittest.TestCase):
     这一条管的是**这一轮跑完**留下的。上一轮留下的由 `Test00NoResidueAtStart`
     在开跑前管 —— 两条各管一头，中间的 helper 一律自愈。
     分开的原因见 `Test00NoResidueAtStart` 的 docstring（一条残留 → 19 条误导性失败）。
+
+    ⚠️ 两条的**处理方式刻意不同**（2026-09-27 定案）：
+
+    | | 管什么 | 有残留时 |
+    |---|---|---|
+    | `Test00NoResidueAtStart` | 上一轮留下的 | **自愈 + skip**（那是上一轮的事故） |
+    | `TestNoResidue`（本类） | 这一轮留下的 | **判红**（那是本轮真没清干净） |
+
+    为什么本类保持判红：**它能跑到这里，就说明这一轮的 `finally` 都执行完了。**
+    在「收尾代码全都跑过」的前提下还有残留，只有一个解释 ——
+    `_clean_probes()` 漏了某条路径。**那是本轮的 bug，必须红。**
+    两条的差别不是宽严，是**「谁的事故」**：上一轮的事故不该判给这一轮，
+    而这一轮的漏清必须当场暴露。
     """
 
     def test_no_probe_files_left_behind(self):
