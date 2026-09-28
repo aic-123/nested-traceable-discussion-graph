@@ -78,15 +78,67 @@ class TestMappingIsExplicit(unittest.TestCase):
         """`causes` 是**一对多** —— 它要展开成一个因果主张 + 两条边。"""
         self.assertEqual(staging.map_relation("causes"), staging.CAUSAL_EXPANSION)
 
-    def test_the_two_without_a_counterpart_are_refused(self):
-        """★ `exemplifies` / `contrasts` 在本仓库里没有位置 —— 停下来问人。
+    def test_the_two_that_used_to_have_no_counterpart_now_map_to_themselves(self):
+        """★ `exemplifies` / `contrasts` 曾经填 `None`（没有位置放）。
 
-        这一条是 B21 的行为那半。硬塞进 `related_to` 也能「跑通」，
-        但那条边在库里长得完全正常，只是信息没了。
+        2026-09-28 需求方拍板在 `RELATION_KINDS` 里**补了这两个种类**，
+        于是它们从「没有对应」变成一对一。
+
+        ⚠️ 注意这不是「兜住」—— 兜住是拿一个语义更宽的 kind 去装；
+        这里是**新增了位置**：这种关系在库里有自己的名字、自己的边、自己的计数。
         """
-        for name in ("exemplifies", "contrasts"):
-            with self.assertRaises(staging.StagingError, msg=f"{name} 竟然被兜住了"):
-                staging.map_relation(name)
+        self.assertEqual(staging.map_relation("exemplifies"), "exemplifies")
+        self.assertEqual(staging.map_relation("contrasts"), "contrasts")
+
+    def test_the_new_kinds_are_real_relation_kinds(self):
+        """新增的种类必须真的进了词汇表 —— 否则落边时会被 `add_relation` 拒。"""
+        for k in ("exemplifies", "contrasts"):
+            self.assertIn(k, scaffold.RELATION_KINDS)
+
+    def test_the_new_kinds_are_lower_layer_edges(self):
+        """两条都是**底层真值边** —— 不是上层派生边。
+
+        分错层的后果：`upper.py` 的信号白名单会把它们当成可读的结构量。
+        """
+        for k in ("exemplifies", "contrasts"):
+            self.assertIn(k, scaffold.RELATION_LAYERS["lower"])
+            self.assertNotIn(k, scaffold.RELATION_LAYERS["upper"])
+
+    def test_the_new_kinds_can_actually_be_written(self):
+        """映射对了，还得**真的落得下去** —— `add_relation` 拿 `RELATION_KINDS` 校。
+
+        只验 `map_relation()` 返回字符串是不够的：它可能返回一个
+        词汇表里不存在的名字，而那要等到落边时才炸。
+        """
+        conn = _fresh()
+        items = [_item("麻雀是一种鸟"), _item("鸟")]
+        items[0]["relations"] = [{"deepread": "exemplifies", "to": 1}]
+        items[1]["relations"] = [{"deepread": "contrasts", "to": 0}]
+        ids = staging.stage_batch(
+            conn, batch="b1", source_uri=BOOK_A, items=items,
+            extracted_by="distiller-v1", asserted_by="某书作者",
+        )
+        rows = conn.execute("SELECT kind, from_id, to_id FROM relation ORDER BY id").fetchall()
+        self.assertEqual([r["kind"] for r in rows], ["exemplifies", "contrasts"])
+        self.assertEqual((rows[0]["from_id"], rows[0]["to_id"]), (ids[0], ids[1]))
+        self.assertEqual((rows[1]["from_id"], rows[1]["to_id"]), (ids[1], ids[0]))
+
+    def test_an_unmapped_entry_still_raises(self):
+        """★ **反向判据**：`None` 分支还在，不是摆设。
+
+        八种现在全都有对应了，`UNMAPPED_DEEPRED` 是空的 —— 那不等于
+        「没有对应就抛错」这条机制失效了。这里往映射表里塞一个 `None`，
+        断言它照样抛。下一次搬一套新的外部词汇，还会撞上同一个岔路口。
+        """
+        real = staging.DEEPRED_RELATION_MAP["supports"]
+        try:
+            staging.DEEPRED_RELATION_MAP["supports"] = None
+            with self.assertRaises(staging.StagingError) as ctx:
+                staging.map_relation("supports")
+        finally:
+            staging.DEEPRED_RELATION_MAP["supports"] = real
+        self.assertIn("没有对应", str(ctx.exception))
+        self.assertEqual(staging.map_relation("supports"), "supports")
 
     def test_an_unknown_name_is_refused(self):
         """上游改了词表，要停下来看 —— 不能兜住。"""
@@ -97,6 +149,8 @@ class TestMappingIsExplicit(unittest.TestCase):
         """声明与表必须一致 —— 改一处不改另一处，B21 会报。"""
         declared = {k for k, v in staging.DEEPRED_RELATION_MAP.items() if v is None}
         self.assertEqual(declared, set(staging.UNMAPPED_DEEPRED))
+        # 八种全部有对应之后，声明是空的 —— 这是**结果**，不是把机制删了。
+        self.assertEqual(staging.UNMAPPED_DEEPRED, ())
 
 
 class TestStagingLandsAsProposed(unittest.TestCase):

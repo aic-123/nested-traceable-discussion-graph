@@ -793,56 +793,73 @@ def check_reference_stores_only_a_locator(
     return hits
 
 
-def check_node_kinds_are_fully_classified(
+def check_vocabulary_is_fully_classified(
     *, kinds: tuple | None = None, rules: dict | None = None,
     prefixes: dict | None = None,
+    relation_kinds: tuple | None = None, layers: dict | None = None,
 ) -> list[tuple[str, int, str]]:
-    """**加一个节点类型，必须同时分档** —— 不许悄悄加。
+    """**加一个节点类型或一种关系，必须同时分档** —— 不许悄悄加。
 
-    这条盯的不是「有哪些类型」，而是「**加类型这件事有没有被看见**」。
-    一个类型进了 `ARTIFACT_TYPES` 却没进 `CONTROL_RULES`，后果不是报错，
-    是它**默认落在最松的那一档上**（没人管）。而那件事在 diff 里几乎看不出来。
+    这条盯的不是「有哪些类型」，而是「**新增词汇这件事有没有被看见**」。
+    一张词汇表加了一项却忘了分档，后果不是报错，是它**默认落在最松的那一档上**
+    （没人管）。而那件事在 diff 里几乎看不出来 —— 一条 `+ "xxx",` 而已。
+
+    两张表用同一套判据，因为它们坏起来是同一种坏：
+
+        `ARTIFACT_TYPES` × `CONTROL_RULES`     节点类型分档
+        `RELATION_KINDS` × `RELATION_LAYERS`   关系种类分层
 
     判据：
 
-    1. `CONTROL_RULES` 四档的并集**恰好等于** `ARTIFACT_TYPES` ——
-       少了（忘了分档）多了（分档里写了不存在的类型）都报。
-    2. 四档**两两不交** —— 一个类型落在两档里，等于两套规矩同时生效。
-    3. `UPPER_ONLY_TYPES` / `INSTANCE_OF_REQUIRED_TYPES` 与对应那一档**逐字相等**
-       （它们是给 B14 那侧读的复述，复述与正文不一致就失去意义）。
-    4. `_PREFIX` 的键集合恰好等于 `ARTIFACT_TYPES` ——
-       加了类型忘了给前缀，会在**运行时** `KeyError`，而不是在这里被拦。
-       （`new_id()` 就是这么写的：`_PREFIX[type_]` 直接取。）
+    1. 每一档的并集**恰好等于**对应词汇表 —— 少了（忘了分档）多了（分档里写了不存在的）都报。
+    2. 同一张表内各档**两两不交** —— 落在两档里等于两套规矩同时生效。
+    3. 每一档**非空** —— 空档位等于没有这一档（判据就落空了）。
+    4. `UPPER_ONLY_TYPES` / `INSTANCE_OF_REQUIRED_TYPES` 与对应那一档**逐字相等**
+       （它们是给别处读的复述，复述走样就失去意义）。
+    5. `_PREFIX` 的键集合恰好等于 `ARTIFACT_TYPES` ——
+       加了类型忘了给前缀，会在**运行时** `KeyError`（`new_id()` 直接 `_PREFIX[type_]`）。
+    6. ★ **上层边只有一条，而且这件事被钉住。** 见下方注释。
+
+    ⚠️ 判据 6 是**刻意的硬编码**，理由与 `EXEMPT` 被钉住一样：
+    上层对底层的影响面越小，单向性越容易守住。多一条上层边是**设计变更**，
+    不是顺手加一条 —— 所以它必须撞到这条检查，逼一次有记录的改动。
     """
     kinds = kinds if kinds is not None else scaffold.ARTIFACT_TYPES
     rules = rules if rules is not None else scaffold.CONTROL_RULES
     prefixes = prefixes if prefixes is not None else scaffold._PREFIX
+    relation_kinds = (
+        relation_kinds if relation_kinds is not None else scaffold.RELATION_KINDS)
+    layers = layers if layers is not None else scaffold.RELATION_LAYERS
 
     hits: list[tuple[str, int, str]] = []
 
     def flag(msg: str) -> None:
         hits.append(("scaffold.py", 1, msg))
 
-    covered: list[str] = []
-    for bucket, members in rules.items():
-        if not members:
-            flag(f"CONTROL_RULES[{bucket!r}] 是空的 —— 空的档位等于没有这一档")
-        covered.extend(members)
+    def classify(what: str, universe, buckets: dict) -> None:
+        covered: list[str] = []
+        for bucket, members in buckets.items():
+            if not members:
+                flag(f"{what}：{bucket!r} 这一档是空的 —— 空档位等于没有这一档")
+            covered.extend(members)
 
-    dupes = sorted({t for t in covered if covered.count(t) > 1})
-    if dupes:
-        flag(f"{dupes} 同时落在多个档里 —— 两套规矩同时生效，等于没有规矩")
+        dupes = sorted({t for t in covered if covered.count(t) > 1})
+        if dupes:
+            flag(f"{what}：{dupes} 同时落在多个档里 —— 两套规矩同时生效，等于没有规矩")
 
-    missing = sorted(set(kinds) - set(covered))
-    if missing:
-        flag(
-            f"{missing} 在 ARTIFACT_TYPES 里，却没进 CONTROL_RULES —— "
-            "它默认落在没人管的那一档上，而这在 diff 里几乎看不出来。"
-            "加类型就要分档，这是这条检查存在的全部理由。"
-        )
-    unknown = sorted(set(covered) - set(kinds))
-    if unknown:
-        flag(f"{unknown} 在 CONTROL_RULES 里，却不是已知的 ARTIFACT_TYPES")
+        missing = sorted(set(universe) - set(covered))
+        if missing:
+            flag(
+                f"{what}：{missing} 在词汇表里，却没分档 —— "
+                "它默认落在没人管的那一档上，而这在 diff 里几乎看不出来。"
+                "加一项就要分档，这是这条检查存在的全部理由。"
+            )
+        unknown = sorted(set(covered) - set(universe))
+        if unknown:
+            flag(f"{what}：{unknown} 在分档表里，却不是已知词汇")
+
+    classify("节点类型", kinds, rules)
+    classify("关系种类", relation_kinds, layers)
 
     if tuple(rules.get("structural", ())) != tuple(scaffold.UPPER_ONLY_TYPES):
         flag("UPPER_ONLY_TYPES 与 CONTROL_RULES['structural'] 不一致 —— 复述走样了")
@@ -855,6 +872,14 @@ def check_node_kinds_are_fully_classified(
             f"（缺前缀：{sorted(set(kinds) - set(prefixes))}；"
             f"多余前缀：{sorted(set(prefixes) - set(kinds))}）—— "
             "`new_id()` 直接 `_PREFIX[type_]`，缺一个会在运行时 KeyError。"
+        )
+
+    upper_edges = tuple(layers.get("upper", ()))
+    if len(upper_edges) != 1:
+        flag(
+            f"上层边有 {len(upper_edges)} 条（{list(upper_edges)}），不是 1 条 —— "
+            "多一条上层边就是多一条「上层影响底层」的通道，那是**设计变更**。"
+            "若确实要加，改这条检查并在工程稿「两条轴」一节里说明为什么。"
         )
     return hits
 
@@ -952,8 +977,8 @@ def check_distiller_mapping_is_explicit(
     落 staging 时保留原词、入层时映射 —— 于是映射表是**唯一的转换点**，
     而转换点最怕的失败模式是：**拿一个万能的 kind 兜住**。
 
-    兜住之后会发生什么：`exemplifies`（这条是那条的一个例子）变成 `related_to`
-    （这两条有点关系）。**库里那条边长得完全正常**，只是信息没了。
+    兜住之后会发生什么：一条具体的论证关系（「这条是那条的一个例子」）
+    退化成「这两条有点关系」。**库里那条边长得完全正常**，只是信息没了。
     没有报错、没有告警、没有人会去看 —— 这是本仓库一直在防的那类病。
 
     判据：
@@ -962,11 +987,19 @@ def check_distiller_mapping_is_explicit(
        多一种说明有人自己造了名字。
     2. ★ **值为 `None` 的集合，必须等于显式声明的 `UNMAPPED_DEEPRED`** ——
        这样「把 None 改成某个 kind」必须同时改两处，一定出现在 diff 里。
+       ⚠️ 2026-09-28 之后两个集合都是空的（八种全部有了对应）。
+       **判据是「两集合相等」而不是「非空」**，所以哪天有人把某格改回 `None`
+       却忘了改声明，这条立刻会报 —— 空不等于失效。
     3. 每个非 `None` 的值必须是已知 kind；元组则每一项都要是，且非空。
     4. ★ **`related_to` 不得出现在映射表的值里** —— 它是那个「兜住一切」的选项。
        DeepRead 的八种里没有一种是「泛泛相关」，所以拿它兜住必然是丢信息。
     5. `map_relation()` 的函数体里必须有 `raise` —— 没对应就要停，
        不能返回一个缺省值。返回缺省值等于**静默兜住**。
+
+    ⚠️ 判据 2 与 5 合起来才说明「那个 `None` 分支还在」。
+    只有判据 2 的话，两集合同时为空时它就没在验任何东西了 ——
+    所以 `test_staging.py` 里另有一条**行为**用例，往映射表里塞一个 `None`
+    并断言 `map_relation()` 真的抛错。静态守形状，行为守它真的会拦。
     """
     mapping = mapping if mapping is not None else staging.DEEPRED_RELATION_MAP
     names = names if names is not None else staging.DEEPRED_RELATIONS
@@ -1073,8 +1106,8 @@ def all_checks():
            "§T4 留白 · 2026-09-28", check_primary_source_is_not_a_quotation)
     yield ("B18", "引用只存定位符，不存正文（副本无法证明自己等于原文）",
            "§T4 留白 · 2026-09-28", check_reference_stores_only_a_locator)
-    yield ("B19", "加一个节点类型必须同时分档（不许悄悄加）",
-           "§T4 留白 · 2026-09-28", check_node_kinds_are_fully_classified)
+    yield ("B19", "加一个节点类型或关系种类必须同时分档（不许悄悄加）",
+           "§T4 留白 · 2026-09-28", check_vocabulary_is_fully_classified)
     yield ("B20", "导入节点不得绕过入层门（staging 只许一个文件写）",
            "§T4 留白 · 2026-09-28", check_imported_never_bypasses_the_gate)
     yield ("B21", "蒸馏关系映射必须显式（没对应的不许偷偷兜住）",

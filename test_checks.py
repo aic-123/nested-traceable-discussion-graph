@@ -846,46 +846,77 @@ class TestB18Fires(unittest.TestCase):
 class TestB19Fires(unittest.TestCase):
     """B19 的判据是**分档完备**，探针扫不到 —— 注入假分档来验。
 
-    ⚠️ 最要紧的是 `test_B19_fires_when_a_kind_is_left_unclassified`：
-    它防的是「加了个类型忘了分档」—— 后果不是报错，是那个类型
-    **默认落在没人管的那一档上**，而这在 diff 里几乎看不出来。
+    两张表用同一套判据（节点类型 × `CONTROL_RULES`、关系种类 × `RELATION_LAYERS`），
+    因为它们坏起来是同一种坏。
+
+    ⚠️ 最要紧的两条：
+    - `test_B19_fires_when_a_kind_is_left_unclassified` —— 加了个类型忘了分档；
+    - `test_B19_fires_when_a_relation_kind_is_left_unclassified` —— 同一种坏，
+      换到关系种类上。这两条必须都有，否则「新增词汇必须被看见」只守了一半。
     """
 
+    # 真实的两张表原样喂进去，只改一处 —— 这样「报的是不是那一处」才验得准。
+    _RULES = {"fixed": ("Claim", "Evidence")}
+    _PREFIX = {"Claim": "claim", "Evidence": "evid"}
+    _LAYERS = {"lower": ("supports",), "upper": ("clustered_into",)}
+
+    def _run(self, **kw):
+        args = dict(kinds=("Claim", "Evidence"), rules=self._RULES,
+                    prefixes=self._PREFIX, relation_kinds=("supports",),
+                    layers=self._LAYERS)
+        args.update(kw)
+        return checks.check_vocabulary_is_fully_classified(**args)
+
     def test_B19_fires_when_a_kind_is_left_unclassified(self):
-        hits = checks.check_node_kinds_are_fully_classified(
+        hits = self._run(
             kinds=("Claim", "Evidence", "忘了分档的新类型"),
-            rules={"fixed": ("Claim", "Evidence")},
-            prefixes={"Claim": "claim", "Evidence": "evid", "忘了分档的新类型": "new"},
+            prefixes={**self._PREFIX, "忘了分档的新类型": "new"},
         )
         self.assertTrue(hits, "有类型没分档，B19 却没反应")
 
+    def test_B19_fires_when_a_relation_kind_is_left_unclassified(self):
+        """★ 同一种坏，换到关系种类上 —— 这条没有的话，关系那半就是空转的。"""
+        hits = self._run(relation_kinds=("supports", "忘了分层的新关系"))
+        self.assertTrue(hits, "有关系种类没分层，B19 却没反应")
+
     def test_B19_fires_when_a_kind_sits_in_two_buckets(self):
-        hits = checks.check_node_kinds_are_fully_classified(
-            kinds=("Claim",),
-            rules={"fixed": ("Claim",), "free": ("Claim",)},
+        hits = self._run(
+            kinds=("Claim",), rules={"fixed": ("Claim",), "free": ("Claim",)},
             prefixes={"Claim": "claim"},
         )
         self.assertTrue(hits, "一个类型落在两档里，B19 却没反应")
 
+    def test_B19_fires_when_a_relation_kind_sits_in_two_layers(self):
+        hits = self._run(layers={"lower": ("supports",),
+                                 "upper": ("supports",)})
+        self.assertTrue(hits)
+
     def test_B19_fires_when_a_prefix_is_missing(self):
         """`new_id()` 直接 `_PREFIX[type_]` —— 缺一个会在**运行时**才炸。"""
-        hits = checks.check_node_kinds_are_fully_classified(
-            kinds=("Claim", "Evidence"),
-            rules={"fixed": ("Claim", "Evidence")},
-            prefixes={"Claim": "claim"},
-        )
+        hits = self._run(kinds=("Claim", "Evidence"), prefixes={"Claim": "claim"})
         self.assertTrue(hits)
 
     def test_B19_fires_on_an_empty_bucket(self):
-        hits = checks.check_node_kinds_are_fully_classified(
-            kinds=("Claim",),
-            rules={"fixed": ("Claim",), "free": ()},
-            prefixes={"Claim": "claim"},
-        )
+        hits = self._run(rules={"fixed": ("Claim", "Evidence"), "free": ()})
+        self.assertTrue(hits)
+
+    def test_B19_fires_when_a_second_upper_edge_appears(self):
+        """★ 上层边只有一条，而且这件事被**钉住**。
+
+        多一条上层边就是多一条「上层影响底层」的通道 —— 那是**设计变更**，
+        不是顺手加一条。这条检查逼一次有记录的改动。
+        """
+        hits = self._run(layers={"lower": ("supports",),
+                                 "upper": ("clustered_into", "又一条上层边")})
+        self.assertTrue(hits, "上层边变成两条，B19 却没反应")
+
+    def test_B19_fires_when_the_upper_bucket_is_emptied(self):
+        """把唯一那条上层边挪走 —— 上层就没边了，单向性无从谈起。"""
+        hits = self._run(layers={"lower": ("supports", "clustered_into")})
         self.assertTrue(hits)
 
     def test_B19_is_quiet_on_the_real_module(self):
-        self.assertEqual(checks.check_node_kinds_are_fully_classified(), [])
+        self.assertEqual(checks.check_vocabulary_is_fully_classified(), [])
 
 
 class TestB20Fires(unittest.TestCase):

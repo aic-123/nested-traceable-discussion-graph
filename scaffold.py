@@ -175,7 +175,53 @@ RELATION_KINDS = (
     # 见 `PRIMARY_SOURCE_KIND` 与 `check_primary_source_is_not_a_quotation`。
     "quoted_from",        # PROV-O wasQuotedFrom      —— 引用了某个外部对象
     "had_primary_source", # PROV-O hadPrimarySource   —— 可当原始来源用
+    # ---- 例示与对照（2026-09-28 · 需求方拍板）--------------------------------
+    # 这两条**不是设计稿里的**，是 DeepRead 八种关系搬过来时暴露的缺口。
+    #
+    # 起因：「其他问题你先找有没有可以参考的成熟方案，不拍脑袋决定」——
+    # 蒸馏关系映射表里 `exemplifies` / `contrasts` 两格填的是 `None`，
+    # 即「本仓库没有位置放，停下来问人」。需求方拍板：**补这两个种类**。
+    #
+    # 为什么不并进现有的：
+    #   exemplifies  `refines` 是「更细」，不是「是一个实例」；
+    #   contrasts    `contradicts` 太强（对照恰恰**不**矛盾）、
+    #                `qualifies` 不对（限定是缩小适用范围，不是并置比较）。
+    # 并进去不是「近似」，是**把这两种关系从库里抹掉** ——
+    # 而抹掉之后那条边在库里长得完全正常。
+    #
+    # ⚠️ 两条都**不进** `RELATION_PARENTS`。理由：那张表编码的是
+    # **派生族**（PROV-O 对齐：quoted_from / had_primary_source ⊑ derived_from）。
+    # 这两条是**论证关系**，不是派生的特化 —— 给它们编一个父类
+    # 是**发明层级**，而层级一旦编错，B17 那条判据就跟着错。
+    "exemplifies",        # 「这条是那条的一个例子」  方向：例子 → 被例示者
+    "contrasts",          # 「这条与那条构成对照」    方向：并置比较，不判高下
 )
+
+# 关系种类的**层**（2026-09-28 加）。
+#
+# 分的是**写权限轴**（底层 / 上层）—— 不是 `intake` 那条**来源轴**
+# （社区 / 导入）。两条轴正交，见工程稿「两条轴必须分开命名」。
+#
+# 为什么要有它：`clustered_into` 的注释里早就写了「这一条与前两种性质不同，
+# 必须分清」—— 那是一句**没有可执行形式**的话。加 `exemplifies` / `contrasts`
+# 时顺手把它落成结构，否则「加一种边、忘了它是哪一层」这件事会一直悄悄发生。
+#
+# ⚠️ `upper` 那一档只有一条，而且**应当一直只有一条**：
+# 上层对底层的影响面越小，「单向性」越容易被守住。
+# 哪天上层需要第二条边，那是**设计变更**，不是顺手加一条。
+RELATION_LAYERS: dict[str, tuple[str, ...]] = {
+    # 底层真值边：记事实。删掉任何一条，底层就少一个事实。
+    "lower": (
+        "contains", "derived_from", "supports", "contradicts", "refines",
+        "related_to", "qualifies", "assumes", "explains", "challenged_by",
+        "causal_premise", "causal_conclusion",
+        "quoted_from", "had_primary_source",
+        "exemplifies", "contrasts",
+    ),
+    # 上层派生边：只表达「这一簇属于这个候选上下文」。
+    # **整批删掉，底层一字不少** —— 这就是单向性约束的可执行形式。
+    "upper": ("clustered_into",),
+}
 
 # 关系层级的**父类表**（2026-09-28 定）。
 #
