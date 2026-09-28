@@ -19,11 +19,12 @@
 | `scaffold.py` | 读写原语：节点、边、版本、事件。**零第三方依赖**（只用 `json` / `sqlite3` / `datetime`） |
 | `pointer.py` | 引用定位符 `(uri, selector)` —— 照抄 **W3C Web Annotation**，**只存位置，不存正文** |
 | `upper.py` | 上层归纳本身 —— 数信号 → 提候选 → 建节点 → 命名 → 出视图 |
+| `rules.py` | 结构规则集 —— `system validation` 的落地形态。判据只能是**已有结构量的合取**，且**没有能力写库** |
 | `staging.py` | 蒸馏**入层门** —— 导入层与社区层分开走；DeepRead 八种关系的**显式映射表** |
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
-| `checks.py` | **21 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 21 条检查**不是空转**的 |
+| `checks.py` | **22 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 22 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -139,6 +140,55 @@ B19 断言 `len(RELATION_LAYERS["upper"]) == 1` —— 多一条就是多一条
 
 代码里**只写白名单，不写禁词**：`READABLE_TABLES` 列的是"我能读什么"，不是"我不许读什么"。把禁词列出来等于自己撞上 B2。
 
+## `system validation` 不是模型判断，是结构量的**合取**
+
+设计稿里说候选可以由「human / **system validation**」触发，却没说后者是什么。
+若它是「模型觉得可以」，那上面那张白名单当场就废了 —— 模型读的是相似度，不是结构量。
+
+所以它被落成**一个声明式的规则集**：每条规则是若干**已有结构量**的合取。
+
+```python
+RULES = {
+    # A 档也能表达：一个量 ≥ 下限
+    "repeatedly_contested": {
+        "all_of": (("challenge_counts", ">=", FLOOR),),
+        "why": "同一条命题被反复质询",
+    },
+    # ★ B 档多出来的就是这个：**合取**
+    "contested_and_revised": {
+        "all_of": (("challenge_counts", ">=", FLOOR),
+                   ("revision_counts",  ">=", FLOOR)),
+        "why": "既被反复质询、又被反复修正",
+    },
+}
+```
+
+同一份信号上跑两条规则，**两张清单不一样** —— 这就是 B 档多出来的东西。
+`test_rules.py` 里有一条用例把它钉住：合取没有比单条件更窄，就说明它什么都没多说。
+
+**分界线是可执行的一条**：
+
+```
+合取    →  可解释（哪一条不满足，指得出来）
+加权和  →  不可解释，而且必然引入一个标量 → 撞 B5
+```
+
+所以 `all_of` 是**元组**、比较符是封闭集合、判定函数里**不许出现算术**。
+`checks.py` 的 **B22** 守这条 —— 顺带把「规则条目多带一个字段（信心、来源、模型输出）」
+也拦掉：那种字段加上去之后，规则**照样长得像一条结构规则**。
+
+**它免确认，理由是结构而不是纪律**：`evaluate()` 的签名里**没有连接对象**。
+
+```python
+def evaluate(signals: dict, *, rules: dict | None = None) -> dict:   # 没有 conn
+```
+
+`rules.py` 连 `sqlite3` 都没 import。所以「判定不写库」不是作者记得别写 ——
+它是**没有能力写**。行为那半在 `test_rules.py`：跑一遍前后**整库逐行比对**。
+
+`rule` 只能传**规则名**（字符串），必须命中 `RULES`，否则 `RuleError` ——
+于是「把模型判断当 promote 条件」这件事**传不进来**，不是「我们约定不传」。
+
 ## 早期阶段它是**休眠**的
 
 这是一个**可证伪的预言**，不是免责声明：
@@ -157,12 +207,13 @@ B19 断言 `len(RELATION_LAYERS["upper"]) == 1` —— 多一条就是多一条
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 21 条否证检查
+python checks.py                      # 22 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
 python -m unittest test_provenance    # 来源与归因：AI 产出不许伪装成人
-python -m unittest test_checks        # 证明那 21 条检查不是空转
+python -m unittest test_rules         # 规则集：判定一个字都没写库 / 合取不是析取
+python -m unittest test_checks        # 证明那 22 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -171,7 +222,7 @@ python -m unittest test_checks        # 证明那 21 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 21 条，B1, B10, ... 无命中。
+否证检查全部通过：共 22 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

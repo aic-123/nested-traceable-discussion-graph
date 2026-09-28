@@ -32,14 +32,16 @@ import tokenize
 from functools import partial
 from pathlib import Path
 
-# ⚠️ 本文件**只有六条检查** import 了被检查的模块（B16–B21），其余全是纯静态扫源码。
+# ⚠️ 本文件**只有八条检查** import 了被检查的模块（B16–B22），其余全是纯静态扫源码。
 # 理由：那几条查的是**词汇表定义的自洽性** —— 那是「规格」，读常量就是读规格，
 # 比用正则去抠源码里的字面量准得多（正则抠字面量改个格式就失效）。
-# 它们不引入运行时依赖：`pointer` / `scaffold` / `staging` 都是本地模块，
-# 且只用标准库。
+# 它们不引入运行时依赖：`pointer` / `scaffold` / `staging` / `rules` / `upper`
+# 都是本地模块，且只用标准库。
 import pointer
+import rules
 import scaffold
 import staging
+import upper
 
 from _console import force_utf8
 
@@ -1053,6 +1055,252 @@ def check_distiller_mapping_is_explicit(
     return hits
 
 
+def _tokens_in(path: Path, lo: int = 0, hi: int = 10 ** 9):
+    """该文件里落在 `[lo, hi)` 行区间内的 token。**字符串与 f-string 的正文不是 token。**
+
+    ⚠️ **B22 用 token 而不是正则，是被实测逼出来的**（2026-09-28）。
+    第一版拿正则扫 `[+*/]` 与模型入口词，`rules.py` 一跑就报了 4 处「出现算术」——
+    **4 处全是提示语里的中文标点与 Markdown 加粗标记**：
+    `（§C7.1 ④ / §C2.5 第 3 档）` 里那个斜杠、`**按名字引用**` 里那两个星号。
+    全是假命中。按修订五那条规矩（**假命中不许用豁免压下去**），改的是检查的范围。
+
+    改成「先去掉字面量再扫」仍然不稳：f-string 在 3.12 之后**不是 STRING token**，
+    得单独处理嵌套。直接看 token 更短也更准 ——
+    字符串正文根本不是 `OP` / `NAME`，天然落在扫描范围外。
+    """
+    src = path.read_text(encoding="utf-8")
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if lo <= tok.start[0] < hi:
+            yield tok
+
+
+# 算术只在这四个**判定函数**里禁。`render()` 不在内 ——
+# 它里面的 `"=" * 64` 是排版，不是计算。把排版也算进去，
+# 这条检查就会逼着人为了过检而改排版，那也是**假命中**。
+_RULES_PURE_FUNCS = ("holds", "evaluate", "explain", "select")
+
+# 出现即报的算术运算符。`+` / `*` 这类一旦能用在读数上，
+# 规则集立刻能表达加权和 —— 那就是打分（撞 B5）。
+_ARITH_OPS = frozenset({
+    "+", "-", "*", "/", "//", "%", "**",
+    "+=", "-=", "*=", "/=", "//=", "%=", "**=",
+})
+
+# 出现即报的名字：模型入口（promote 条件不许含模型判断）
+# 与数据库入口（判定必须**没有能力写库**）。
+# 两者都只扫 `NAME` token —— 所以写在提示语里不算，写在代码里才算。
+_RULES_MODEL_NAMES = re.compile(
+    r"(model|llm|embed|similar|predict|infer|neural|prompt)\w*", re.I)
+_RULES_DB_NAMES = frozenset({
+    "sqlite3", "conn", "connection", "cursor", "executemany", "execute", "commit",
+})
+
+# 规则条目的**字段白名单**。同 `pointer.SELECTOR_FIELDS` 的手法：
+# 「不许多存什么」的判据是**结构性的**（白名单之外一个字段都放不进去），
+# 不是「扫一遍看看有没有敏感词」。加一个 `confidence` 之类的字段
+# 等于让规则携带模型判断 —— 那就撞到这条检查存在的全部理由上。
+_RULES_SPEC_FIELDS = ("all_of", "why")
+
+
+def check_promotion_condition_is_structural(
+    *, vocab: dict | None = None, ruleset: dict | None = None,
+    operators: tuple | None = None, tier: str | None = None,
+    tiers: tuple | None = None, floor: int | None = None,
+    upper_vocab: dict | None = None, upper_floor: int | None = None,
+    source_path: Path | None = None,
+) -> list[tuple[str, int, str]]:
+    """promote 条件**不许含模型判断**（阶段 5）—— 它的判据形态必须只由结构量构成。
+
+    这条盯的是设计稿第 10 节那个空洞：`human / system validation` 里的
+    **`system validation` 到底是什么**。若它是「模型觉得可以」，
+    B14 那条不变量（上层不读热度类信号）当场就没了 ——
+    因为「模型觉得可以」读的是文本相似度之类的**非结构量**。
+
+    需求方 2026-09-28 拍板走 **B 档**：规则集允许把**已有结构信号的组合**写成判据。
+    B 档与 C 档（从攻击图算接受集）的分界线是**可执行的一条**：
+
+        规则的输出只能是「进不进清单」，不得是「有多好」
+
+    所以判据里只有**合取**，没有加权和。一旦有人加算术，它就从结构判据变成了打分。
+
+    判据：
+
+    1. `TIER` 必须是 `derived_view`（`§C2.5` 第 3 档），且落在 `C25_TIERS` 里。
+       本模块不写库、不下断言，所以免确认；挪到第 2 档就要补
+       可推翻 + 抽样审计 + 计改判率三件事 —— 那是**设计变更**，必须撞到这里。
+    2. `OPERATORS` **恰好**是那三个比较符 —— 规则集只许比较。
+    3. ★ `SIGNAL_VOCAB` 与 `upper.COUNT_SIGNALS` **相等**（名字与读法都要）。
+       「允许系统读哪些结构量」只能有一个答案：多一个是**越界通道**，
+       少一个是**静默的残缺**。这是「两集合相等」那条老手法的第三次使用。
+    4. ★ `FLOOR` 与 `upper.MIN_SUPPORT` 相等 —— 同一个结构下限有两处定义，
+       分叉就会出现「归纳说够、规则说不够」这种没人解释得清的状态。
+    5. 每条规则的 `all_of` 是**非空元组**，每个条件是三元组，
+       信号名在词表内、比较符在 `OPERATORS` 内、比较值是整数。
+    6. 每条规则必须有非空的 `why` —— 判定清单要能自述，
+       那是 `§C2.5` 第 3 档「可解释」的落地，不是可选项。
+    6b. 规则条目的字段是**白名单**：只有 `all_of` 与 `why`。
+       多一个字段（信心、来源、模型输出）就是让规则携带别的东西，
+       而它照样长得像一条结构规则。同 `pointer.SELECTOR_FIELDS` 的手法。
+    7. 源码级（**看 token，不看正则**）：判定函数里没有算术运算符；
+       全文没有模型入口名、没有数据库入口名。
+
+    ⚠️ 判据 7 的最后一条是这条检查最要紧的地方，值得单独说：
+    **`rules.py` 连数据库都碰不到**，所以「判定不写库」不是靠作者记得别写 ——
+    它是**结构上没有能力写**。行为那半在 `test_rules.py`：
+    跑一遍前后快照比对。
+
+    --- 口径修订一：从正则改成 token（2026-09-28，当天）------------------------
+
+    第一版拿正则扫 `[+*/]` 与模型入口词，`rules.py` 一跑报了 **7 处假命中**：
+
+    | 报的 | 真相 |
+    |---|---|
+    | `evaluate()` / `select()` 里出现算术 ×4 | 提示语里的 `（§C7.1 ④ / §C2.5 第 3 档）` 与 `**按名字引用**` —— 中文正文里的斜杠不是除号，Markdown 加粗标记不是乘号 |
+    | `evaluate()` / `explain()` / `select()` 里出现算术 ×3 | **`def` 行里的 `*,`（keyword-only 标记）** —— 它不是算术 |
+
+    **一条真命中都没有。** 按修订五那条规矩（假命中不许用豁免压下去），
+    改的是**检查的范围**：先去掉字面量（f-string 在 3.12 之后不是 STRING token，
+    不好处理），最后干脆**直接看 token** —— 字符串正文根本不是 `OP` / `NAME`，
+    而 `def` 那一行从扫描区间里排除。
+
+    ⚠️ 静态拦不住什么，说清楚（同 B14 / B18 / B20 的既有立场）：
+    它拦不住「调用方自己算一个分再传进 `select(rule=...)`」——
+    但 `select` 只收**规则名**，模型判断传不进来（`RuleError`）。
+    真正绕得过去的是「把模型判断写进 `SIGNAL_VOCAB` 的某个信号名背后」，
+    而那要改 `upper.count_signals()` —— 那是另一条会被 B14 盯上的路。
+    """
+    source_path = source_path or (ROOT / "rules.py")
+    is_real = source_path.name == "rules.py"
+    if is_real and not source_path.is_file():
+        return [("rules.py", 1,
+                 "规则集文件不在 —— `system validation` 就没落地，"
+                 "promote 条件只能是模型判断，那是这条检查要防的东西。")]
+
+    vocab = rules.SIGNAL_VOCAB if vocab is None else vocab
+    ruleset = rules.RULES if ruleset is None else ruleset
+    operators = rules.OPERATORS if operators is None else operators
+    tier = rules.TIER if tier is None else tier
+    tiers = rules.C25_TIERS if tiers is None else tiers
+    floor = rules.FLOOR if floor is None else floor
+    upper_vocab = upper.COUNT_SIGNALS if upper_vocab is None else upper_vocab
+    upper_floor = upper.MIN_SUPPORT if upper_floor is None else upper_floor
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, n: int = 1) -> None:
+        hits.append((source_path.name, n, msg))
+
+    # 1 档位
+    if tier not in tiers:
+        flag(f"判定档位 {tier!r} 不在 {list(tiers)} 里 —— 档位是 `§C2.5` 的封闭集合。")
+    elif tier != "derived_view":
+        flag(
+            f"判定档位是 {tier!r}，不是 'derived_view' —— 本模块不写库、不下断言，"
+            "所以它免确认；挪到第 2 档（派生标注）就要补「可推翻 + 抽样审计 + 计改判率」"
+            "三件事。那是设计变更，不是顺手改一个字符串。"
+        )
+
+    # 2 比较符
+    if set(operators) != {">=", "<=", "=="}:
+        flag(
+            f"比较符集合是 {sorted(operators)}，不是恰好那三个 —— "
+            "规则集只许比较。加算术运算符（`+` / `*` / 平均）等于把它变成打分，撞 B5。"
+        )
+
+    # 3 词表与上层白名单相等
+    if set(vocab) != set(upper_vocab):
+        flag(
+            f"规则词表与 upper.COUNT_SIGNALS 对不上"
+            f"（规则多：{sorted(set(vocab) - set(upper_vocab))}；"
+            f"规则少：{sorted(set(upper_vocab) - set(vocab))}）—— "
+            "「允许系统读哪些结构量」只能有一个答案：多一个就是越界通道，"
+            "少一个就是静默的残缺（规则看上去能说更多，实际读不到）。"
+        )
+    elif dict(vocab) != dict(upper_vocab):
+        flag("两边键一样、读的东西不一样 —— 同一个信号名在两张表里指向不同的表 / 事件。")
+
+    # 4 结构下限
+    if floor != upper_floor:
+        flag(
+            f"规则集下限是 {floor}，upper.MIN_SUPPORT 是 {upper_floor} —— "
+            "它们是同一个结构下限（「一条依据的簇不叫簇」）。两处定义分叉之后，"
+            "会出现「归纳说够、规则说不够」这种没人解释得清的状态。"
+        )
+
+    # 5 / 6 规则集本身
+    for rid in sorted(ruleset):
+        spec = ruleset[rid]
+        extra = sorted(set(spec) - set(_RULES_SPEC_FIELDS))
+        if extra:
+            flag(f"规则 {rid!r} 多带了字段 {extra} —— 规则条目的字段是**白名单**"
+                 f"（只有 {list(_RULES_SPEC_FIELDS)}）。多一个字段就是让规则"
+                 "携带别的东西（信心、来源、模型输出），而它照样长得像一条结构规则。")
+        conditions = spec.get("all_of")
+        if not isinstance(conditions, tuple):
+            flag(f"规则 {rid!r} 的 all_of 不是元组 —— 单个条件会让「合取」"
+                 "这件事在形状上消失，而形状正是 B 档与 C 档的分界。")
+            continue
+        if not conditions:
+            flag(f"规则 {rid!r} 的 all_of 是空的 —— 空合取恒真，"
+                 "它会把所有目标都收进来，等于一条没有判据的规则。")
+        # ⚠️ 一种很常见的写法错误：单条件忘了包一层 ——
+        # `all_of = ("challenge_counts", ">=", 2)`。它**是个三元组、看着像对的**，
+        # 但语义上它成了「三个条件」，而三个都不是三元组。
+        # 不单独认出来的话，报出来的是三句「有个条件不是三元组：'challenge_counts'」——
+        # 每句都成立，合起来却指不到真正的那一处。
+        elif (len(conditions) == 3 and isinstance(conditions[0], str)
+                and isinstance(conditions[1], str)):
+            flag(f"规则 {rid!r} 的 all_of 看起来是**单个条件没包成合取**："
+                 f"{conditions!r} —— 要写成 `((信号, 比较符, 值),)` 才算一条规则。"
+                 "这不是格式问题：**形状就是「合取」这件事本身**。")
+            continue
+        for cond in conditions:
+            if not isinstance(cond, tuple) or len(cond) != 3:
+                flag(f"规则 {rid!r} 里有个条件不是 (信号, 比较符, 值) 三元组：{cond!r}")
+                continue
+            name, op, want = cond
+            if name not in vocab:
+                flag(f"规则 {rid!r} 读 {name!r} —— 它不在 SIGNAL_VOCAB 里。"
+                     "词表是封闭的：能读什么只能有一个答案。")
+            if op not in operators:
+                flag(f"规则 {rid!r} 用了比较符 {op!r}，它不在 OPERATORS 里。")
+            if isinstance(want, bool) or not isinstance(want, int):
+                flag(f"规则 {rid!r} 的比较值 {want!r} 不是整数 —— "
+                     "判据只许跟结构量的次数比。")
+        why = spec.get("why")
+        if not (isinstance(why, str) and why.strip()):
+            flag(f"规则 {rid!r} 没有 why —— 判定清单要能自述。"
+                 "`§C2.5` 第 3 档的「可解释」不是可选的。")
+
+    # 7 源码级（**看 token，不看正则** —— 理由见 `_tokens_in`）
+    for name in _RULES_PURE_FUNCS:
+        body, start = _function_body(source_path, name)
+        if start is None:
+            flag(f"{source_path.name} 里找不到 {name}() —— 判定的形状就没人守了。")
+            continue
+        hi = (body[-1][0] + 1) if body else (start + 1)
+        # ⚠️ 从 `start + 1` 起，**跳过 def 那一行**：`*,`（keyword-only 标记）
+        # 与 `**kwargs` 里的星号也是 `OP`，它们不是算术。实测被这两个报过假命中。
+        for n, op in [(t.start[0], t.string)
+                      for t in _tokens_in(source_path, start + 1, hi)
+                      if t.type == tokenize.OP and t.string in _ARITH_OPS]:
+            flag(f"{name}() 里出现算术运算符 {op!r} —— 判据只许比较，"
+                 "不许把两个读数合起来算。一旦能算，规则集立刻能表达加权和，"
+                 "那就是打分（撞 B5）。", n)
+
+    for tok in _tokens_in(source_path):
+        if tok.type != tokenize.NAME:
+            continue
+        if _RULES_MODEL_NAMES.match(tok.string):
+            flag("出现模型入口 —— promote 条件不许含模型判断（阶段 5 出口判据 ③）。"
+                 "「模型觉得可以」读的是相似度之类的非结构量，B14 那条不变量当场就没了。",
+                 tok.start[0])
+        elif tok.string in _RULES_DB_NAMES:
+            flag(f"出现数据库入口 {tok.string!r} —— 判定必须**没有能力写库**，"
+                 "否则它就不是 `§C2.5` 第 3 档（免确认）而是第 2 档。", tok.start[0])
+    return hits
+
+
 def _function_body(path: Path, name: str):
     """(函数体的 (行号, 文本) 列表, 起始行号)。
 
@@ -1112,6 +1360,8 @@ def all_checks():
            "§T4 留白 · 2026-09-28", check_imported_never_bypasses_the_gate)
     yield ("B21", "蒸馏关系映射必须显式（没对应的不许偷偷兜住）",
            "§T4 留白 · 2026-09-28", check_distiller_mapping_is_explicit)
+    yield ("B22", "promote 条件不许含模型判断（判据只能是结构量的合取）",
+           "§C2.5 第 3 档 · 2026-09-28", check_promotion_condition_is_structural)
 
 
 def main() -> int:

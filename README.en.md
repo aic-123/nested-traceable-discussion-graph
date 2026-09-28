@@ -17,10 +17,14 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | File | What it is |
 |---|---|
 | `scaffold.py` | Read/write primitives: nodes, edges, revisions, events. **Zero third-party dependencies** (only `json` / `sqlite3` / `datetime`) |
+| `pointer.py` | Reference locators `(uri, selector)` — copied from **W3C Web Annotation**; stores **position, never the body text** |
 | `upper.py` | The upper induction layer itself — count signals → propose → promote → name → view |
-| `checks.py` | 15 falsification checks. **Each one is executable**, not an adjective in a doc |
-| `test_upper.py` | Behavioural verification of the upper layer — depends only on `scaffold.py` and the stdlib |
-| `test_checks.py` | Proves those 15 checks **aren't vacuous** |
+| `rules.py` | The structural rule set — what `system validation` actually means. Criteria are **conjunctions of existing structural counts**, and the module **has no ability to write** |
+| `staging.py` | The distillation **intake gate** — imported and community layers take different doors; an **explicit mapping table** for DeepRead's eight relations |
+| `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
+| `checks.py` | **22 falsification checks. Each one is executable**, not an adjective in a doc |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
+| `test_checks.py` | Proves those 22 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -89,6 +93,52 @@ Only three, all of the form **"how many times did something happen"**, never "ho
 
 The code **writes only the whitelist, never the forbidden words**: `READABLE_TABLES` states "what I may read", not "what I may not". Listing the forbidden words means tripping over B2 yourself.
 
+## `system validation` is not a model judgement — it's a **conjunction** of structural counts
+
+The design document says a candidate may be triggered by "human / **system validation**" and never says what the latter is.
+If it were "the model thinks it's fine", the whitelist above would be void on the spot — a model reads similarity, not structural counts.
+
+So it is landed as **a declarative rule set**: every rule is a conjunction of **already-existing structural counts**.
+
+```python
+RULES = {
+    # expressible at tier A: one count >= a floor
+    "repeatedly_contested": {
+        "all_of": (("challenge_counts", ">=", FLOOR),),
+        "why": "the same proposition was challenged repeatedly",
+    },
+    # ★ this is what tier B adds: a **conjunction**
+    "contested_and_revised": {
+        "all_of": (("challenge_counts", ">=", FLOOR),
+                   ("revision_counts",  ">=", FLOOR)),
+        "why": "repeatedly challenged AND repeatedly revised",
+    },
+}
+```
+
+Run both rules over the same signals and **the two lists differ** — that's what tier B buys.
+`test_rules.py` pins it: if the conjunction is no narrower than a single count, it said nothing new.
+
+**The dividing line is one executable sentence:**
+
+```
+conjunction  →  explainable (point at the condition that failed)
+weighted sum →  not explainable, and it necessarily introduces a scalar → trips B5
+```
+
+So `all_of` is a **tuple**, the comparison operators are a closed set, and the judging functions may **contain no arithmetic**.
+**B22** in `checks.py` guards this — and along the way it also blocks a rule entry **carrying an extra field** (confidence, source, model output): add one and the rule **still looks exactly like a structural rule**.
+
+**It is exempt from confirmation for a structural reason, not by discipline**: `evaluate()`'s signature has **no connection object**.
+
+```python
+def evaluate(signals: dict, *, rules: dict | None = None) -> dict:   # no conn
+```
+
+`rules.py` doesn't even import `sqlite3`. So "the judgement does not write to the store" isn't the author remembering not to — it **has no ability to**. The behavioural half lives in `test_rules.py`: it compares **every row of every table** before and after.
+
+`rule` accepts only a **rule name** (a string) that must hit `RULES`, otherwise `RuleError` — so "use the model's judgement as a promote condition" **cannot be passed in**, rather than "we agreed not to".
+
 ## On a young corpus it is **dormant**
 
 This is a **falsifiable prediction**, not a disclaimer:
@@ -107,9 +157,13 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 15 falsification checks
+python checks.py                      # the 22 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
-python -m unittest test_checks        # proves those 15 checks aren't vacuous
+python -m unittest test_pointer       # locators: position only, never the body
+python -m unittest test_staging       # intake gate: no gate, no `active`
+python -m unittest test_provenance    # provenance: AI output may not masquerade as human
+python -m unittest test_rules         # rule set: nothing written / conjunction ≠ disjunction
+python -m unittest test_checks        # proves those 22 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:
@@ -118,7 +172,7 @@ python -m unittest test_checks        # proves those 15 checks aren't vacuous
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 15 条，B1, B10, ... 无命中。
+否证检查全部通过：共 22 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` skips 7 tests** — output is `OK (skipped=7)`. This is **intentional**:

@@ -1,4 +1,4 @@
-"""`checks.py` 自己的测试 —— 证明 B1–B13 **不是空转**。
+"""`checks.py` 自己的测试 —— 证明 B1–B22 **不是空转**。
 
 --- 为什么会有这个文件 -----------------------------------------------------
 
@@ -275,7 +275,7 @@ class TestEveryCheckFires(unittest.TestCase):
         # B4 也是**限定范围**的（只扫 upper.py），所以这个探针也盖不到它 ——
         # 由 TestB4IsScopedToTheUpperLayer 单独钉。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
-                          "B16", "B17", "B18", "B19", "B20", "B21"}
+                          "B16", "B17", "B18", "B19", "B20", "B21", "B22"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -995,6 +995,233 @@ class TestB21Fires(unittest.TestCase):
 
     def test_B21_is_quiet_on_the_real_module(self):
         self.assertEqual(checks.check_distiller_mapping_is_explicit(), [])
+
+
+def _b22_probe(source: str, **kw) -> list:
+    """把 source 写成临时 `.py` 当 **B22 的源码靶**，跑完删掉。
+
+    为什么要单独一条路：B22 只扫 `rules.py` 一个文件，
+    `_scan_with_temp_py()` 那条（全仓扫、喂 `_tmp_probe_zzz.py`）**到不了它** ——
+    探针文件不叫 `rules.py`，B22 根本不看它。
+
+    探针路径复用同一个名字，所以「有没有残留」仍由 `Test00` / `TestNoResidue`
+    各管一头，中间的 helper 一律自愈。
+    """
+    probe = ROOT / "_tmp_probe_zzz.py"
+    _clean_probes()
+    probe.write_text(source, encoding="utf-8")
+    try:
+        return checks.check_promotion_condition_is_structural(
+            source_path=probe, **kw)
+    finally:
+        _clean_probes()
+
+
+def _said(hits: list, phrase: str) -> list:
+    """命中里**说到了这句**的那些。`(路径, 行号, 说明)` 的说明在第 3 格。"""
+    return [h for h in hits if phrase in h[2]]
+
+
+# 一份**形状完整**的探针骨架：四个判定函数都在。
+# 这样「只报我要验的那一处」才验得准 —— 缺一个函数 B22 会另报一笔「找不到 xxx()」。
+_RULES_PROBE = (
+    "def holds(actual, op, want):\n"
+    "    return actual >= want\n"
+    "def evaluate(signals):\n"
+    "    return signals\n"
+    "def explain(signals):\n"
+    "    return signals\n"
+    "def select(candidates):\n"
+    "    return candidates\n"
+)
+
+# ★ 反向判据的语料：**长得像算术、其实全是正文**。
+#
+# 这几样是 2026-09-28 实测撞到的假命中，一样不少：
+#   `（§C7.1 ④ / §C2.5 第 3 档）`  中文正文里的斜杠不是除号
+#   `**按名字引用**`                Markdown 加粗标记不是乘号
+#   `def evaluate(signals, *, ...)`  keyword-only 的 `*` 不是算术
+#   `"the model says yes"`          写在字面量里的模型名不是模型入口
+#   `"import sqlite3"`              写在字面量里的数据库名不是数据库入口
+_RULES_PROSE_PROBE = (
+    "def holds(actual, op, want):\n"
+    "    return actual >= want\n"
+    "def evaluate(signals, *, rules=None):\n"
+    "    note = '（§C7.1 ④ / §C2.5 第 3 档）**按名字引用**'\n"
+    "    other = 'the model says yes; import sqlite3; conn.execute()'\n"
+    "    return note, other\n"
+    "def explain(signals):\n"
+    "    return signals\n"
+    "def select(candidates):\n"
+    "    return candidates\n"
+)
+
+
+class TestB22Fires(unittest.TestCase):
+    """B22 的判据是**判据形态**，探针扫不到 —— 注入假规则集 / 假源码来验。
+
+    ⚠️ 最要紧的三条：
+
+    * `test_B22_fires_when_a_rule_carries_an_extra_field` ——
+      规则条目多一个字段（信心、来源、模型输出），而它照样长得像一条结构规则；
+    * `test_B22_fires_when_arithmetic_appears_in_a_judging_function` ——
+      判据一旦能算，规则集立刻能表达加权和，那就是打分（B 档滑向 C 档的路）；
+    * `test_B22_does_not_fire_on_prose_that_looks_like_arithmetic` ——
+      **反向判据**。它挡的是「改完正文才过检」那条路：假命中不许用改正文解决。
+    """
+
+    # 真实的形状原样喂进去，只改一处 —— 这样「报的是不是那一处」才验得准。
+    _VOCAB = {"challenge_counts": "relation:challenged_by"}
+    _RULESET = {"r": {"all_of": (("challenge_counts", ">=", 2),), "why": "一条规则"}}
+    _OPS = (">=", "<=", "==")
+    _UPPER_VOCAB = {"challenge_counts": "relation:challenged_by"}
+
+    def _run(self, **kw):
+        args = dict(vocab=self._VOCAB, ruleset=self._RULESET, operators=self._OPS,
+                    tier="derived_view", tiers=("must_confirm", "derived_annotation",
+                                                "derived_view"),
+                    floor=2, upper_vocab=self._UPPER_VOCAB, upper_floor=2)
+        args.update(kw)
+        return checks.check_promotion_condition_is_structural(**args)
+
+    # --- 规则集本身 -------------------------------------------------------
+
+    def test_B22_fires_when_a_rule_reads_a_signal_outside_the_vocabulary(self):
+        hits = self._run(ruleset={"r": {
+            "all_of": (("vote_counts", ">=", 2),), "why": "热度类信号"}})
+        self.assertTrue(_said(hits, "不在 SIGNAL_VOCAB 里"), hits)
+
+    def test_B22_fires_when_the_vocabulary_and_the_upper_whitelist_disagree(self):
+        """★ 两个方向都要报。
+
+        规则多一个 = 越界通道；规则少一个 = 静默的残缺（规则看上去能说更多，
+        实际读不到）。只报一个方向，这半就漏了。
+        """
+        extra = self._run(vocab={**self._VOCAB, "vote_counts": "vote"})
+        self.assertTrue(_said(extra, "规则多"), extra)
+        missing = self._run(upper_vocab={**self._UPPER_VOCAB, "dispute_counts": "x"})
+        self.assertTrue(_said(missing, "规则少"), missing)
+
+    def test_B22_fires_when_the_same_name_means_two_things(self):
+        hits = self._run(vocab={"challenge_counts": "relation:supports"})
+        self.assertTrue(_said(hits, "指向不同"), hits)
+
+    def test_B22_fires_when_the_floor_and_the_inducer_disagree(self):
+        hits = self._run(upper_floor=3)
+        self.assertTrue(_said(hits, "MIN_SUPPORT"), hits)
+
+    def test_B22_fires_when_the_tier_moves_off_the_derived_view(self):
+        """★ 挪到第 2 档就要补「可推翻 + 抽样审计 + 计改判率」三件事。
+
+        那不是改一个字符串，是**设计变更** —— 必须撞到这里。
+        """
+        hits = self._run(tier="derived_annotation")
+        self.assertTrue(_said(hits, "第 2 档"), hits)
+
+    def test_B22_fires_when_the_tier_is_not_a_known_one(self):
+        hits = self._run(tier="第 4 档")
+        self.assertTrue(_said(hits, "封闭集合"), hits)
+
+    def test_B22_fires_when_the_operators_grow_an_arithmetic_one(self):
+        hits = self._run(operators=(">=", "<=", "==", "+"))
+        self.assertTrue(_said(hits, "比较符集合"), hits)
+
+    def test_B22_fires_when_a_rule_is_not_a_conjunction(self):
+        """★ 单个条件没包成合取 —— `("challenge_counts", ">=", 2)`。
+
+        它**是个三元组、看着像对的**，但语义上成了「三个条件」。
+        不单独认出来的话，报出来是三句「有个条件不是三元组」——
+        每句都成立，合起来却指不到真正的那一处。
+        """
+        hits = self._run(ruleset={"r": {"all_of": ("challenge_counts", ">=", 2),
+                                        "why": "单条件没包一层"}})
+        self.assertTrue(_said(hits, "没包成合取"), hits)
+        # 另一半：`all_of` 根本不是元组（比如写成了列表）
+        loose = self._run(ruleset={"r": {
+            "all_of": [("challenge_counts", ">=", 2)], "why": "写成了列表"}})
+        self.assertTrue(_said(loose, "不是元组"), loose)
+
+    def test_B22_fires_on_an_empty_conjunction(self):
+        """空合取**恒真** —— 它会把所有目标都收进来，等于一条没有判据的规则。"""
+        hits = self._run(ruleset={"r": {"all_of": (), "why": "空"}})
+        self.assertTrue(_said(hits, "恒真"), hits)
+
+    def test_B22_fires_when_a_rule_carries_an_extra_field(self):
+        """★ 字段白名单：多一个字段就是让规则携带别的东西。
+
+        而它**照样长得像一条结构规则** —— 这正是这条检查存在的理由。
+        """
+        hits = self._run(ruleset={"r": {
+            "all_of": (("challenge_counts", ">=", 2),),
+            "why": "看起来完全正常",
+            "confidence": 0.9,
+        }})
+        self.assertTrue(_said(hits, "多带了字段"), hits)
+
+    def test_B22_fires_when_a_rule_has_no_why(self):
+        """`§C2.5` 第 3 档的「可解释」不是可选项。"""
+        hits = self._run(ruleset={"r": {
+            "all_of": (("challenge_counts", ">=", 2),), "why": "   "}})
+        self.assertTrue(_said(hits, "没有 why"), hits)
+
+    def test_B22_fires_when_the_condition_value_is_not_an_int(self):
+        hits = self._run(ruleset={"r": {
+            "all_of": (("challenge_counts", ">=", 0.5),), "why": "小数"}})
+        self.assertTrue(_said(hits, "不是整数"), hits)
+
+    # --- 源码级 -----------------------------------------------------------
+
+    def test_B22_fires_when_arithmetic_appears_in_a_judging_function(self):
+        """★ 判据一旦能算，规则集立刻能表达加权和 —— 那就是打分（撞 B5）。"""
+        hits = _b22_probe(
+            _RULES_PROBE.replace("def evaluate(signals):\n    return signals\n",
+                                 "def evaluate(signals):\n    return signals * 2\n"))
+        self.assertTrue(_said(hits, "算术运算符"), hits)
+
+    def test_B22_fires_on_a_model_entry(self):
+        hits = _b22_probe("import llm\n" + _RULES_PROBE)
+        self.assertTrue(_said(hits, "模型入口"), hits)
+
+    def test_B22_fires_on_a_database_entry(self):
+        """★ 判定必须**没有能力写库** —— 连连接对象都不许出现。"""
+        hits = _b22_probe(_RULES_PROBE + "\nconn = 1\n")
+        self.assertTrue(_said(hits, "数据库入口"), hits)
+
+    def test_B22_fires_when_a_judging_function_is_gone(self):
+        hits = _b22_probe(_RULES_PROBE.replace(
+            "def explain(signals):\n    return signals\n", ""))
+        self.assertTrue(_said(hits, "找不到 explain()"), hits)
+
+    def test_B22_does_not_fire_on_prose_that_looks_like_arithmetic(self):
+        """★ **反向判据** —— 这条是本段实测踩出来的，不能少。
+
+        假命中的下场是「把文件加进 EXEMPT」（修订五），也就是**检查死掉**。
+        所以它必须能被指着证明：**同一段正文，换个位置就不再是违规。**
+
+        反过来的那半同样要紧：上面 `test_B22_fires_when_arithmetic_...`
+        证明**真的算术抓得到**。两条一起，才说明扫描范围收得既准又没瞎。
+        """
+        hits = _b22_probe(_RULES_PROSE_PROBE)
+        self.assertEqual(_said(hits, "算术运算符"), [],
+                         "正文里的斜杠 / 加粗标记被当成算术了")
+        self.assertEqual(_said(hits, "模型入口"), [],
+                         "字面量里的模型名被当成模型入口了")
+        self.assertEqual(_said(hits, "数据库入口"), [],
+                         "字面量里的数据库名被当成数据库入口了")
+
+    def test_B22_fires_when_the_rule_set_file_is_missing(self):
+        """规则集文件不在 —— `system validation` 就没落地，
+        promote 条件只能落回「模型觉得可以」，而那正是这条检查要防的东西。
+
+        靶取一个**名字叫 `rules.py` 但不存在**的路径 ——
+        不碰真文件，也走到那条分支。
+        """
+        hits = checks.check_promotion_condition_is_structural(
+            source_path=ROOT / "不存在的目录" / "rules.py")
+        self.assertTrue(_said(hits, "规则集文件不在"), hits)
+
+    def test_B22_is_quiet_on_the_real_module(self):
+        self.assertEqual(checks.check_promotion_condition_is_structural(), [])
 
 
 class TestNoResidue(unittest.TestCase):
