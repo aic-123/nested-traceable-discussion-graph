@@ -32,6 +32,15 @@ import tokenize
 from functools import partial
 from pathlib import Path
 
+# ⚠️ 本文件**只有六条检查** import 了被检查的模块（B16–B21），其余全是纯静态扫源码。
+# 理由：那几条查的是**词汇表定义的自洽性** —— 那是「规格」，读常量就是读规格，
+# 比用正则去抠源码里的字面量准得多（正则抠字面量改个格式就失效）。
+# 它们不引入运行时依赖：`pointer` / `scaffold` / `staging` 都是本地模块，
+# 且只用标准库。
+import pointer
+import scaffold
+import staging
+
 from _console import force_utf8
 
 ROOT = Path(__file__).parent
@@ -164,6 +173,19 @@ def check_no_threshold() -> list[tuple[str, int, str]]:
 
     代价：**会过度报告**。比如 `v` 沾过观测点之后，再 `if v < 5`（其实是个下标边界）
     也会被记一笔。这是刻意的取舍 —— 本检查是否证用的，**漏报是致命的，误报只是吵**。
+
+    --- 与 `policy.py` 的边界（2026-09-28 加）--------------------------------
+
+    这条管的是**观测点**：「换说法率」「改判率」这类从 event 表算出来的比率。
+    它防的是**单向性违反** —— 把算出来的评估结果写回 artifact 字段。
+
+    `policy.py` 的 `POLICY` **不是观测点**：那是外部的**运维门槛**，
+    读的是「导入条数与社区贡献条数的比」这类跨层的量，结果只触发
+    「暂停导入」这类开关，**不写回任何字段**、不参与排序、不影响内容展示。
+
+    ⚠️ 但本检查是**按词抓的**（`ratio` / `rate` / `duration` / `elapsed` / `cost`
+    与数字比较），分不出语义。所以 `POLICY` 的键名**刻意避开这些词** ——
+    这是**实现限制**，不是语义边界。若哪天这条改成能读语义的判据，规避可以撤掉。
     """
     hits = []
     for path in sorted(ROOT.rglob("*.py")):
@@ -520,6 +542,503 @@ def check_upper_nodes_are_not_named_by_machine(
 _MACHINE_NAME_LITERAL = re.compile(r"""["']text["']\s*:\s*["'][^"']+["']""")
 
 
+def check_ai_sources_require_attribution(
+    *, kinds: tuple | None = None, ai: tuple | None = None,
+    default: str | None = None, target: Path | None = None,
+) -> list[tuple[str, int, str]]:
+    """AI 产出的档位必须**能**被要求写明「谁主张的」—— 而且这条要求真的在。
+
+    这条防的是**AI 产出伪装成人**（设计稿里那个「AI 转录的书算哪一档」的问题）。
+    两个判据，缺一不可：
+
+    **判据一：档位集合自洽。** 三条，都是结构性的，不依赖具体值：
+
+    - `AI_SOURCES ⊆ DIGITAL_SOURCE_TYPES` —— 不许有指向不存在档位的名字；
+    - `AI_SOURCES` **非空** —— 空集合等于「没有任何产出需要署名」；
+    - `DIGITAL_SOURCE_DEFAULT` **不在** `AI_SOURCES` 里 —— 默认档是人创建，
+      若它同时被算成 AI 档，守卫就自相矛盾（每个走默认值的调用都会触发它）。
+
+    **判据二：守卫真的在。** 光有常量不算，得有人拿它拦 ——
+    `add_artifact` 函数体里必须同时出现 `AI_SOURCES` / `asserted_by` / `raise`。
+
+    为什么这条**不能**用扫正则做：它查的是「集合关系」和「函数体里有没有某个守卫」，
+    正则抠源码字面量改个排版就失效。所以它读 `scaffold` 的常量。
+
+    ⚠️ 它**不能**代替 `test_provenance.py` 那条行为验证。
+    静态只证明「守卫的代码在」；守卫**真的会拦**由行为测试证明。
+    """
+    kinds = kinds if kinds is not None else scaffold.DIGITAL_SOURCE_TYPES
+    ai = ai if ai is not None else scaffold.AI_SOURCES
+    default = default if default is not None else scaffold.DIGITAL_SOURCE_DEFAULT
+    target = target or (ROOT / "scaffold.py")
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str) -> None:
+        hits.append((target.name, 1, msg))
+
+    if not ai:
+        flag("AI_SOURCES 是空的 —— 等于没有任何产出需要写明主张者")
+    for k in ai:
+        if k not in kinds:
+            flag(f"AI_SOURCES 里的 {k!r} 不是已知的 digital_source_type")
+    if default in ai:
+        flag(
+            f"默认档位 {default!r} 同时被算成 AI 档 —— "
+            "那会让每个走默认值的调用都触发署名守卫，自相矛盾"
+        )
+
+    # 名字里含 `Algorithmic` 的档位，必须**全部**被算成 AI 档。
+    #
+    # 这条为什么是**结构性**的而不是硬编码：IPTC 词表给 AI 相关的档位都用
+    # 同一个词根命名（trainedAlgorithmicMedia / compositeWithTrainedAlgorithmicMedia /
+    # algorithmicallyEnhanced / algorithmicMedia）。所以判据可以落在命名规律上 ——
+    # 漏掉一个，那一档的产出就不需要署名，而它照样是 AI 产出。
+    for k in kinds:
+        if "algorithmic" in k.lower() and k not in ai:
+            flag(
+                f"{k!r} 的名字表明它是 AI 档，却没被算进 AI_SOURCES —— "
+                "那一档的产出不需要写明主张者"
+            )
+
+    body, start = _function_body(target, "add_artifact")
+    if start is None:
+        flag("找不到 add_artifact —— 守卫无从谈起")
+    else:
+        joined = "\n".join(t for _, t in body)
+        missing = [w for w in ("AI_SOURCES", "asserted_by", "raise") if w not in joined]
+        if missing:
+            flag(
+                f"add_artifact 里看不到守卫（缺 {'/'.join(missing)}）—— "
+                "常量定义了 AI 档，却没人拿它拦"
+            )
+    return hits
+
+
+def check_primary_source_is_not_a_quotation(
+    *, kinds: tuple | None = None, parents: dict | None = None,
+    primary: str | None = None,
+) -> list[tuple[str, int, str]]:
+    """引用**不许**被当成原始来源 —— 这是「引用 ≠ 派生」的可执行形式。
+
+    PROV-O 给的是一棵**层次**树，不是互斥二分：
+
+        wasDerivedFrom
+          ├── wasQuotedFrom        ← 引用：派生的**弱特化**
+          └── hadPrimarySource     ← 原始来源：最强的**一档**
+
+    所以「能不能当原始来源用」只读 `had_primary_source`，**不读 `quoted_from`**。
+    这条把它写成结构判据，不靠命名自觉：
+
+    1. `quoted_from` **必须**有父类 —— 它是弱特化，不是平级的 kind。
+    2. `PRIMARY_SOURCE_KIND` 与 `quoted_from` **不是同一个值**。
+    3. ★ **引用不得出现在原始来源的祖先链上** —— 两者是**兄弟**，不是父子。
+    4. 父类表里的 key / value 都必须是已知 kind —— 不许指向不存在的种类。
+
+    ⚠️ 判据里**没有**「原始来源必须是顶层」这一条 —— 因为它本来就不是：
+    PROV-O 里 `wasQuotedFrom` / `hadPrimarySource` / `wasRevisionOf`
+    **三者都是** `wasDerivedFrom` 的子属性。原始来源**也有父类**，
+    真正的判据是「**引用不能是它的祖先**」。
+
+    四条合起来就是一句话：**引用与原始来源是同一族的两个兄弟档，
+    而原始来源永远不是「某种引用」。**
+
+    改坏它的方式很具体：把 `PRIMARY_SOURCE_KIND` 改成 `"quoted_from"`，
+    或把 `quoted_from` 从 `RELATION_PARENTS` 里删掉（那样它就不再是弱特化，
+    变成一个平级的 kind，谁都可能拿它当来源用）。
+    """
+    kinds = kinds if kinds is not None else scaffold.RELATION_KINDS
+    parents = parents if parents is not None else scaffold.RELATION_PARENTS
+    primary = primary if primary is not None else scaffold.PRIMARY_SOURCE_KIND
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str) -> None:
+        hits.append(("scaffold.py", 1, msg))
+
+    if primary not in kinds:
+        flag(f"PRIMARY_SOURCE_KIND={primary!r} 不是已知的 relation kind")
+    if "quoted_from" not in kinds:
+        flag("缺 quoted_from —— 引用没有种类，这条检查无从落地")
+    if "quoted_from" not in parents:
+        flag(
+            "quoted_from 没有父类 —— 引用必须是派生的**弱特化**"
+            "（PROV-O：wasQuotedFrom ⊑ wasDerivedFrom）"
+        )
+    if primary == "quoted_from":
+        flag("PRIMARY_SOURCE_KIND 指向了 quoted_from —— 引用不是原始来源")
+
+    # ★ 核心判据：引用**不得**出现在原始来源的祖先链上。
+    #
+    # 为什么这是核心：若 `had_primary_source ⊑ quoted_from`（原始来源是引用的一种），
+    # 「引用」就成了「原始来源」的**上位** —— 于是任何引用都自动够得着来源这一档，
+    # 「引用不许升级成来源」这条约束当场失效。
+    #
+    # ⚠️ 原始来源**自己可以有父类**：PROV-O 里 wasQuotedFrom / hadPrimarySource /
+    # wasRevisionOf **三者都是** wasDerivedFrom 的子属性。所以判据不是
+    # 「原始来源必须顶层」，而是「**引用不能是它的祖先**」—— 两者是**兄弟**，不是父子。
+    chain, seen = [], set()
+    cur = parents.get(primary)
+    while cur and cur not in seen:
+        chain.append(cur)
+        seen.add(cur)
+        cur = parents.get(cur)
+    if "quoted_from" in chain:
+        flag(
+            f"引用出现在原始来源 {primary!r} 的祖先链上"
+            f"（{' → '.join([primary] + chain)}）—— "
+            "那等于说「原始来源是引用的一种」，引用就自动够得着来源这一档了"
+        )
+
+    for child, parent in parents.items():
+        if child not in kinds:
+            flag(f"父类表的 key {child!r} 不是已知 kind")
+        if parent not in kinds:
+            flag(f"父类表的 value {parent!r} 不是已知 kind")
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# 阶段 2 / 3 新增的四条（2026-09-28）
+# ---------------------------------------------------------------------------
+
+# 「承载正文」的字段名。pointer 的规定字段里出现任何一个，就是又开始存正文了。
+#
+# ⚠️ 注意 `exact` **不在**这张表里 —— 它是 `TextQuoteSelector` 的规定字段，
+# 是**定位所需的最小引文**，不是正文。两者的界在**字段身份**上，不在字数上：
+# 「另存一份正文」会表现为一个**白名单之外**的字段，那个会被拦。
+_BODY_FIELDS = ("body", "text", "content", "fulltext", "full_text", "bodytext", "raw")
+
+
+def check_reference_stores_only_a_locator(
+    *, kinds: tuple | None = None, fields: dict | None = None,
+    body: tuple | None = None, target: Path | None = None,
+) -> list[tuple[str, int, str]]:
+    """引用**只存定位符，不存正文**（阶段 2 的出口判据 ④）。
+
+    为什么这条不是「省空间」那种优化，而是结构约束：**副本无法证明自己等于原文**。
+    原文改了、撤了、换版本，副本不会跟着变，而读者看不出来。
+    存定位符则相反 —— 仓库里**没有**任何能被误当成原文的东西。
+
+    它的可执行形式是**字段白名单**，不是长度限制（长度限制是阈值，会滑进 B3 那一族）。
+
+    判据：
+
+    1. `SELECTOR_KINDS` 与 `SELECTOR_FIELDS` 的键**恰好相等** ——
+       加一种 selector 必须同时改两处，于是它一定出现在 diff 里。
+    2. 每个 selector 名以 `Selector` 结尾（W3C 命名），不自造名字。
+    3. ★ **规定字段里不得出现承载正文的字段名** —— 这就是「不存正文」本身。
+    4. `POINTER_FIELD` 非空，且它自己不是正文承载字段名。
+    5. `verify` / `verify_selector` 的函数体里必须出现 `raise PointerError` ——
+       光有白名单不算，得有人拿它拦。
+    6. `scaffold._append_revision` 的函数体里必须出现 `pointer` ——
+       **写入时守卫真的接上了**。⚠️ 接在那里而不是 `add_artifact` 里，
+       是因为 `revise()` 是另一条写入路径（B14 的行为验证正是抓到了
+       「走 revise 的间接写静态看不见」）。
+
+    改坏它的方式很具体：给 `TextQuoteSelector` 加一个 `"full"` 字段存全文，
+    或者把 `verify()` 里那段拒绝多余字段的代码删掉。两条都会被这里抓到。
+    """
+    kinds = kinds if kinds is not None else pointer.SELECTOR_KINDS
+    fields = fields if fields is not None else pointer.SELECTOR_FIELDS
+    body = body if body is not None else _BODY_FIELDS
+    target = target or (ROOT / "pointer.py")
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, where: str | None = None) -> None:
+        hits.append(((where or target.name), 1, msg))
+
+    if set(kinds) != set(fields):
+        only_kinds = sorted(set(kinds) - set(fields))
+        only_fields = sorted(set(fields) - set(kinds))
+        flag(
+            f"SELECTOR_KINDS 与 SELECTOR_FIELDS 对不上"
+            f"（只在 KINDS 里：{only_kinds}；只在 FIELDS 里：{only_fields}）"
+        )
+
+    for k in kinds:
+        if not (isinstance(k, str) and k.endswith("Selector")):
+            flag(f"selector 名 {k!r} 不以 Selector 结尾 —— 本系统照抄 W3C，不自造名字")
+
+    for k, spec in fields.items():
+        required, optional = spec
+        declared = [*required, *optional]
+        clash = sorted(set(declared) & set(body))
+        if clash:
+            flag(
+                f"{k} 的规定字段里有 {clash} —— 那是承载正文的字段名。"
+                "定位符只存位置：正文去 uri 取，别在仓库里留一份副本。"
+            )
+
+    if not pointer.POINTER_FIELD or pointer.POINTER_FIELD in body:
+        flag(f"POINTER_FIELD={pointer.POINTER_FIELD!r} 不是一个像样的键名")
+
+    for fn in ("verify", "verify_selector"):
+        fn_body, start = _function_body(target, fn)
+        if start is None:
+            flag(f"pointer.py 里找不到 {fn}() —— 白名单没有人拿它拦")
+        elif "raise PointerError" not in "\n".join(t for _, t in fn_body):
+            flag(f"{fn}() 里没有 raise PointerError —— 它只定义了形状，没有拦")
+
+    guard, gstart = _function_body(ROOT / "scaffold.py", "_append_revision")
+    if gstart is None:
+        flag("scaffold.py 里找不到 _append_revision()", where="scaffold.py")
+    elif "pointer" not in "\n".join(t for _, t in guard):
+        flag(
+            "_append_revision() 里看不到 pointer —— 定位符的写入时守卫没接上。"
+            "接在这一层才有用：它是 add_artifact 与 revise **共用**的唯一漏斗。",
+            where="scaffold.py",
+        )
+    return hits
+
+
+def check_node_kinds_are_fully_classified(
+    *, kinds: tuple | None = None, rules: dict | None = None,
+    prefixes: dict | None = None,
+) -> list[tuple[str, int, str]]:
+    """**加一个节点类型，必须同时分档** —— 不许悄悄加。
+
+    这条盯的不是「有哪些类型」，而是「**加类型这件事有没有被看见**」。
+    一个类型进了 `ARTIFACT_TYPES` 却没进 `CONTROL_RULES`，后果不是报错，
+    是它**默认落在最松的那一档上**（没人管）。而那件事在 diff 里几乎看不出来。
+
+    判据：
+
+    1. `CONTROL_RULES` 四档的并集**恰好等于** `ARTIFACT_TYPES` ——
+       少了（忘了分档）多了（分档里写了不存在的类型）都报。
+    2. 四档**两两不交** —— 一个类型落在两档里，等于两套规矩同时生效。
+    3. `UPPER_ONLY_TYPES` / `INSTANCE_OF_REQUIRED_TYPES` 与对应那一档**逐字相等**
+       （它们是给 B14 那侧读的复述，复述与正文不一致就失去意义）。
+    4. `_PREFIX` 的键集合恰好等于 `ARTIFACT_TYPES` ——
+       加了类型忘了给前缀，会在**运行时** `KeyError`，而不是在这里被拦。
+       （`new_id()` 就是这么写的：`_PREFIX[type_]` 直接取。）
+    """
+    kinds = kinds if kinds is not None else scaffold.ARTIFACT_TYPES
+    rules = rules if rules is not None else scaffold.CONTROL_RULES
+    prefixes = prefixes if prefixes is not None else scaffold._PREFIX
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str) -> None:
+        hits.append(("scaffold.py", 1, msg))
+
+    covered: list[str] = []
+    for bucket, members in rules.items():
+        if not members:
+            flag(f"CONTROL_RULES[{bucket!r}] 是空的 —— 空的档位等于没有这一档")
+        covered.extend(members)
+
+    dupes = sorted({t for t in covered if covered.count(t) > 1})
+    if dupes:
+        flag(f"{dupes} 同时落在多个档里 —— 两套规矩同时生效，等于没有规矩")
+
+    missing = sorted(set(kinds) - set(covered))
+    if missing:
+        flag(
+            f"{missing} 在 ARTIFACT_TYPES 里，却没进 CONTROL_RULES —— "
+            "它默认落在没人管的那一档上，而这在 diff 里几乎看不出来。"
+            "加类型就要分档，这是这条检查存在的全部理由。"
+        )
+    unknown = sorted(set(covered) - set(kinds))
+    if unknown:
+        flag(f"{unknown} 在 CONTROL_RULES 里，却不是已知的 ARTIFACT_TYPES")
+
+    if tuple(rules.get("structural", ())) != tuple(scaffold.UPPER_ONLY_TYPES):
+        flag("UPPER_ONLY_TYPES 与 CONTROL_RULES['structural'] 不一致 —— 复述走样了")
+    if tuple(rules.get("instance_of_required", ())) != tuple(scaffold.INSTANCE_OF_REQUIRED_TYPES):
+        flag("INSTANCE_OF_REQUIRED_TYPES 与对应那一档不一致 —— 复述走样了")
+
+    if set(prefixes) != set(kinds):
+        flag(
+            f"_PREFIX 与 ARTIFACT_TYPES 对不上"
+            f"（缺前缀：{sorted(set(kinds) - set(prefixes))}；"
+            f"多余前缀：{sorted(set(prefixes) - set(kinds))}）—— "
+            "`new_id()` 直接 `_PREFIX[type_]`，缺一个会在运行时 KeyError。"
+        )
+    return hits
+
+
+def check_imported_never_bypasses_the_gate(
+    *, channels: tuple | None = None, states: tuple | None = None,
+    passed: str | None = None, gate_path: Path | None = None,
+    entry_path: Path | None = None, write_scan: bool = True,
+) -> list[tuple[str, int, str]]:
+    """导入层的节点**不得绕过入层门**直接算数（阶段 3 的出口判据 ②）。
+
+    门挡在两处，缺一处就是摆设：
+
+        `scaffold.activate()`   ← 唯一能写 `active` 的入口。挡在这里，
+                                  才挡得住「不走 staging、直接建了再确认」
+        `staging.py`            ← 唯一写 `staging` 表的模块。挡在这里，
+                                  才挡得住「跳过记录」
+
+    判据：
+
+    1. 常量自洽：`staged` / `direct` 两个口都在，`GATE_STATES` 含 `passed`。
+    2. ★ **`staging` 这张表只在一个文件里被写** —— 形状同 B10（发号器出不了
+       `scaffold.py`）。任何别处出现 `INSERT INTO staging` 就报。
+    3. `staging.py` 里必须出现 `intake="staged"` —— 它真的走那个口，
+       而不是建完之后**宣称**自己走了。
+    4. `scaffold.activate()` 的函数体里必须同时出现 `staged` 与 `GATE_PASSED`
+       —— 门真的挡在唯一入口上。
+
+    ⚠️ 它挡不住的，说清楚：调用方把 `intake` 填成 `"direct"` 就绕过去了。
+    那是**撒谎**，不是漏洞。这条（静态）与 `test_staging.py`（行为）合起来
+    才是完整的，形状同 B14。
+    """
+    channels = channels if channels is not None else scaffold.INTAKE_CHANNELS
+    states = states if states is not None else scaffold.GATE_STATES
+    passed = passed if passed is not None else scaffold.GATE_PASSED
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, where: str = "scaffold.py") -> None:
+        hits.append((where, 1, msg))
+
+    for need in ("direct", "staged"):
+        if need not in channels:
+            flag(f"INTAKE_CHANNELS 里没有 {need!r} —— 两个口必须都在，缺一个就没法区分")
+    if passed not in states or scaffold.GATE_PENDING not in states:
+        flag(f"GATE_STATES={states} 不完整 —— 门的三个状态要都在")
+
+    writer = None
+    if write_scan:
+        for path in sorted(ROOT.glob("*.py")):
+            if path.name in EXEMPT:
+                continue
+            for n, text in code_lines(path):
+                if re.search(r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+staging\b", text, re.I):
+                    writer = path.name
+                    if path.name != "staging.py":
+                        hits.append((path.name, n, text.strip()))
+
+        if writer is None:
+            flag(
+                "没有任何模块写 `staging` 表 —— 门没有落点，这条检查无从谈起。",
+                where="（全仓）",
+            )
+
+    gate_src = gate_path or (ROOT / "staging.py")
+    if not gate_src.is_file():
+        flag("staging.py 不在 —— 入层门还没有实现", where="（全仓）")
+    else:
+        joined = "\n".join(t for _, t in code_lines(gate_src))
+        if 'intake="staged"' not in joined:
+            flag('staging.py 里没有 intake="staged" —— 它没有真的走那个口',
+                 where="staging.py")
+
+    entry = entry_path or (ROOT / "scaffold.py")
+    body, start = _function_body(entry, "activate")
+    if start is None:
+        flag(f"在 {entry.name} 里找不到 activate() —— 门无处可挡",
+             where=entry.name)
+    else:
+        joined = "\n".join(t for _, t in body)
+        for word in ("staged", "GATE_PASSED"):
+            if word not in joined:
+                flag(f"activate() 里看不到 {word} —— 门没挡在写 active 的唯一入口上",
+                     where=entry.name)
+    return hits
+
+
+def check_distiller_mapping_is_explicit(
+    *, mapping: dict | None = None, names: tuple | None = None,
+    unmapped: tuple | None = None, kinds: tuple | None = None,
+) -> list[tuple[str, int, str]]:
+    """蒸馏的关系映射**必须显式** —— 没对应的不许偷偷兜住（阶段 3）。
+
+    DeepRead 的八种关系与本仓库的 `RELATION_KINDS` 不是一套。
+    落 staging 时保留原词、入层时映射 —— 于是映射表是**唯一的转换点**，
+    而转换点最怕的失败模式是：**拿一个万能的 kind 兜住**。
+
+    兜住之后会发生什么：`exemplifies`（这条是那条的一个例子）变成 `related_to`
+    （这两条有点关系）。**库里那条边长得完全正常**，只是信息没了。
+    没有报错、没有告警、没有人会去看 —— 这是本仓库一直在防的那类病。
+
+    判据：
+
+    1. 映射表的键**恰好等于** DeepRead 的八种 —— 少一种说明上游变了没人管，
+       多一种说明有人自己造了名字。
+    2. ★ **值为 `None` 的集合，必须等于显式声明的 `UNMAPPED_DEEPRED`** ——
+       这样「把 None 改成某个 kind」必须同时改两处，一定出现在 diff 里。
+    3. 每个非 `None` 的值必须是已知 kind；元组则每一项都要是，且非空。
+    4. ★ **`related_to` 不得出现在映射表的值里** —— 它是那个「兜住一切」的选项。
+       DeepRead 的八种里没有一种是「泛泛相关」，所以拿它兜住必然是丢信息。
+    5. `map_relation()` 的函数体里必须有 `raise` —— 没对应就要停，
+       不能返回一个缺省值。返回缺省值等于**静默兜住**。
+    """
+    mapping = mapping if mapping is not None else staging.DEEPRED_RELATION_MAP
+    names = names if names is not None else staging.DEEPRED_RELATIONS
+    unmapped = unmapped if unmapped is not None else staging.UNMAPPED_DEEPRED
+    kinds = kinds if kinds is not None else scaffold.RELATION_KINDS
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str) -> None:
+        hits.append(("staging.py", 1, msg))
+
+    if set(mapping) != set(names):
+        flag(
+            f"映射表与 DeepRead 八种对不上"
+            f"（缺：{sorted(set(names) - set(mapping))}；"
+            f"多：{sorted(set(mapping) - set(names))}）"
+        )
+
+    declared = {k for k, v in mapping.items() if v is None}
+    if declared != set(unmapped):
+        flag(
+            f"值为 None 的是 {sorted(declared)}，"
+            f"而 UNMAPPED_DEEPRED 声明的是 {sorted(unmapped)} —— 两处必须一致。"
+            "不一致说明有人把「没有对应」偷偷改成了某个 kind，"
+            "而那正是这条检查要拦的动作。"
+        )
+
+    for name, mapped in mapping.items():
+        values = mapped if isinstance(mapped, tuple) else (mapped,)
+        if mapped is None:
+            continue
+        if not values:
+            flag(f"{name!r} 映射到了一个空元组")
+        for v in values:
+            if v not in kinds:
+                flag(f"{name!r} 映射到 {v!r}，而它不是已知的 relation kind")
+            if v == "related_to":
+                flag(
+                    f"{name!r} 被映射到 related_to —— 那是「兜住一切」的那个选项。"
+                    "DeepRead 的八种里没有一种是泛泛相关，所以拿它兜住必然是丢信息。"
+                )
+
+    body, start = _function_body(ROOT / "staging.py", "map_relation")
+    if start is None:
+        flag("staging.py 里找不到 map_relation()")
+    elif "raise" not in "\n".join(t for _, t in body):
+        flag(
+            "map_relation() 里没有 raise —— 没对应时它会返回一个缺省值，"
+            "那等于**静默兜住**，而兜住之后那条边在库里长得完全正常。"
+        )
+    return hits
+
+
+def _function_body(path: Path, name: str):
+    """(函数体的 (行号, 文本) 列表, 起始行号)。
+
+    从 `def <name>(` 那一行之后起，到下一个顶格 `def ` 或文件末尾止。
+    找不到时返回 `([], None)`。
+    """
+    body: list[tuple[int, str]] = []
+    start = None
+    for n, text in code_lines(path):
+        if start is None:
+            if text.lstrip().startswith(f"def {name}("):
+                start = n
+            continue
+        if text.lstrip().startswith("def "):
+            break
+        body.append((n, text))
+    return body, start
+
+
 def all_checks():
     """(编号, 说明, 条款, 返回命中的函数) —— **唯一的登记表**。
 
@@ -548,6 +1067,18 @@ def all_checks():
            check_upper_does_not_write_down)
     yield ("B15", "上层节点不带系统生成的名字（命名归人）", "§C2.0 §C7.1 ③",
            check_upper_nodes_are_not_named_by_machine)
+    yield ("B16", "AI 档位必须写明谁主张的（AI 产出不许伪装成人）",
+           "§T4 留白 · 2026-09-28", check_ai_sources_require_attribution)
+    yield ("B17", "引用不许被当成原始来源（引用 ⊑ 派生，但不是原始来源）",
+           "§T4 留白 · 2026-09-28", check_primary_source_is_not_a_quotation)
+    yield ("B18", "引用只存定位符，不存正文（副本无法证明自己等于原文）",
+           "§T4 留白 · 2026-09-28", check_reference_stores_only_a_locator)
+    yield ("B19", "加一个节点类型必须同时分档（不许悄悄加）",
+           "§T4 留白 · 2026-09-28", check_node_kinds_are_fully_classified)
+    yield ("B20", "导入节点不得绕过入层门（staging 只许一个文件写）",
+           "§T4 留白 · 2026-09-28", check_imported_never_bypasses_the_gate)
+    yield ("B21", "蒸馏关系映射必须显式（没对应的不许偷偷兜住）",
+           "§T4 留白 · 2026-09-28", check_distiller_mapping_is_explicit)
 
 
 def main() -> int:

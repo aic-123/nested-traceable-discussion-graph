@@ -31,6 +31,12 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+# ⚠️ 本模块 import `pointer`，方向是**单向**的：`pointer` 不 import 任何本地模块。
+# 这样 `_append_revision()` 能在**序列化那一刻**验定位符，而不会有循环依赖。
+# 为什么必须在这一层验：`add_artifact()` 与 `revise()` 都从这里过 ——
+# 它是内容落库的**唯一漏斗**。放在这里，就没有第二条路能存进一个坏定位符。
+import pointer
+
 # ---------------------------------------------------------------------------
 # 权威常量
 # ---------------------------------------------------------------------------
@@ -83,6 +89,44 @@ ARTIFACT_TYPES = (
 # 但树的形状本身也是结构要求 —— `Position` 是树上一个确定的层
 # （需求方 2026-09-27 明确要求「论点一层」，并认可二元对立暂代多立场）。
 
+# ---------------------------------------------------------------------------
+# 类型分档（CONTROL_RULES · 2026-09-28）
+# ---------------------------------------------------------------------------
+
+# 上面那张 `ARTIFACT_TYPES` 只说「**有哪些**类型」，没说「**谁有权建、建的时候必须带什么**」。
+# 这一张补上。四档，按控制强度从紧到松排：
+#
+#   fixed                受控词汇。建的时候**必须显式给出类型**，不许走默认、不许推断。
+#                        为什么紧：这些都是命题与论证的结构件。类型推断错了，
+#                        不是「记错了一个字段」—— 是**替人立论**（`§C2.0`）。
+#   structural           只许**上层**建（`upper.py`）。见 `UPPER_TYPE`。
+#                        为什么紧：它一进底层类型表就会被误当成底层的命题。
+#   instance_of_required 可以建，但**必须挂在父节点上**（`contains` 边）。
+#                        为什么：`Debate` / `Subtopic` 是容器，不挂父节点就不是容器，
+#                        而一个悬空的容器在查询里长得跟命题一样。
+#   free                 无附加约束。`Vote` 是讨论行为的记录，本来就不该被约束。
+#
+# ⚠️ 这张表与 `ARTIFACT_TYPES` 必须**恰好**互相覆盖（并集相等、四档两两不交）。
+#    那条判据由 B19 盯着。加一个新类型却忘了分档，B19 会报 ——
+#    这正是这张表存在的理由：**加类型这件事不许悄悄发生。**
+CONTROL_RULES: dict[str, tuple[str, ...]] = {
+    "fixed": (
+        "Topic", "Position", "Claim", "Evidence", "Argument",
+        "Mechanism", "Assumption", "Counterexample", "Counterargument",
+        "Challenge",
+    ),
+    "structural": ("Context",),
+    "instance_of_required": ("Debate", "Subtopic"),
+    "free": ("Vote",),
+}
+
+# `Context` 只许上层建 —— 这条判据的落点是 `upper.UPPER_TYPE`。
+# 在这里复述一次是为了让 B19 能读它，不必 import 上层模块（方向也不对）。
+UPPER_ONLY_TYPES = CONTROL_RULES["structural"]
+
+# 建的时候必须挂父节点的类型（`contains` 边）。
+INSTANCE_OF_REQUIRED_TYPES = CONTROL_RULES["instance_of_required"]
+
 # `§C3.2` 的六种，并上 `§C4` / `§C6.3` 要求但未列入的四种。同上，取并集。
 RELATION_KINDS = (
     "contains",        # §C3.2
@@ -115,11 +159,77 @@ RELATION_KINDS = (
     # 名字取「被并进某个上下文」的意思，不取「相似于」：
     # 「相似」是一种距离判断，而本层只用结构量（见 upper.py 模块开头）。
     "clustered_into",    # §C7.1  底层节点 → 上层 Context
+    # ---- 引用与原始来源（PROV-O 对齐，2026-09-28）----------------------------
+    # 这两条**不在任何现有条款里** —— `§C3.2` 的六种、`§C4` 的四种都没有它们。
+    # 按 `§T4` 走**留白项**：自选 + 声明 + 可回退。
+    #
+    # 为什么需要：书籍蒸馏会把大量**外部已有的论证**引进来，而「引用了它」
+    # 和「由它推导出」是两件事。PROV-O 已经给了标准答案，不自造：
+    #
+    #     wasQuotedFrom        ⊑  wasDerivedFrom      ← 引用是派生的**弱特化**
+    #     hadPrimarySource     ⊑  wasDerivedFrom      ← 原始来源是最强的**一档**
+    #
+    # ⚠️ 关键：`quoted_from` 与 `had_primary_source` **不是互斥的两个选项**，
+    # 是**同一族里强弱不同的两档**。所以「能不能当原始来源用」的判据
+    # 只读 `had_primary_source`，**不读 `quoted_from`** ——
+    # 见 `PRIMARY_SOURCE_KIND` 与 `check_primary_source_is_not_a_quotation`。
+    "quoted_from",        # PROV-O wasQuotedFrom      —— 引用了某个外部对象
+    "had_primary_source", # PROV-O hadPrimarySource   —— 可当原始来源用
 )
+
+# 关系层级的**父类表**（2026-09-28 定）。
+#
+# 为什么是常量而不是一张表 —— 五条理由，按分量排：
+#   1. **一致性**：`ARTIFACT_TYPES` / `RELATION_KINDS` / `ARTIFACT_STATES` /
+#      `RELATION_STATES` / `COUNT_SIGNALS` **全是代码常量**。只有层级进表，
+#      就会出现「同一类东西两种存法」。
+#   2. **改动留痕**：改常量走 git diff —— 谁改的、什么时候、为什么，全在提交历史里。
+#      改表则不留痕，除非再写一条 event，**而「记录改表的动作」本身又要写表**。
+#   3. **少一条写路径**：表是可写的，存在一张可写的层级表，就存在一条
+#      「谁都能改层级」的路径。常量不是运行时状态，**AI 没有路径改它** ——
+#      这与 B14 的精神一致：不变量越少依赖运行时状态，越稳。
+#   4. **规模不匹配**：层级只有 3 条、2 层。用递归 CTE 查这个，是过度设计。
+#   5. **B17 更简单**：`dict.get()` 一层，不需要递归 CTE 与环检测。
+#
+# 唯一会让它变成表的条件：关系种类膨胀到几十种**且**需要运行时改层级。
+# 但即便到那时，**层级变更应该是一次有记录的设计变更，不是运行时数据** ——
+# 所以这条条件基本不会出现。
+RELATION_PARENTS = {
+    "quoted_from":        "derived_from",
+    "had_primary_source": "derived_from",
+}
+
+# 「能不能当**原始来源**用」的**唯一**判据。
+#
+# ⚠️ 不是 `quoted_from` —— 引用是派生的弱特化，**不等于**原始来源。
+# 这个区分就是 `§T4` 留白项里「引用不许自动升级成知识来源」那句的可执行形式。
+PRIMARY_SOURCE_KIND = "had_primary_source"
 
 # Artifact 生命周期（`§C3.1`「具有独立身份、状态、生命周期」）。
 # 唯一能写 active 的路径是 Arena 层的用户确认 —— 见 arena/debate.py。
 ARTIFACT_STATES = ("proposed", "active", "superseded")
+
+# 「**从哪个口进来的**」（2026-09-28）。
+#
+# 为什么需要它，而不是从 `digital_source_type` 推：
+# 那两个问题**不是一回事**。`upper.py` 建的 Context 是 `trainedAlgorithmicMedia`
+# （完全由 AI 生成），而蒸馏某本书产出的 AI 归纳**也是** `trainedAlgorithmicMedia` ——
+# 来源档位一模一样，**层级却不同**：前者是上层派生，后者是导入层。
+# 用来源档推层级，必然把这两者混成一个。
+#
+# 于是单开一栏，各答一个问题：
+#   digital_source_type   内容**怎么产生的**（IPTC 词表）
+#   intake                **从哪个口进来的**（本表）
+#   state                 现在**处在什么生命周期**
+INTAKE_CHANNELS = (
+    "direct",   # 直接写入：社区贡献、上层 Context、以及一切非蒸馏来源
+    "staged",   # 经**入层门**进来：书籍蒸馏等批量导入
+)
+
+# 门的三个状态。`passed` 之外都不许 activate —— 见 `activate()` 的守卫。
+GATE_STATES = ("pending", "passed", "rejected")
+GATE_PENDING = "pending"
+GATE_PASSED = "passed"
 
 # Relation 状态（`§C2.4` 可拒绝 / 可修改）。
 # 机器产出的边默认 `active` —— 这是 `§C2.5` 的「派生标注：默认生效 + 可推翻」，
@@ -131,11 +241,60 @@ RELATION_STATES = ("active", "rejected", "superseded")
 STATUS_DEFAULT = "unresolved"
 STATUS_HOOK_ONLY = "verified"
 
+# ---------------------------------------------------------------------------
+# 来源分档（2026-09-28）
+# ---------------------------------------------------------------------------
+
+# 「这条内容**怎么产生的**」—— 抄 IPTC `digitalSourceType` 受控词表，**逐字不改**。
+#
+# 为什么不自造：原先只有 `BOOK` / `COMMUNITY` 两档，但 **AI 转录的书归哪一档答不上来** ——
+# 填 `BOOK` 就把 AI 的转述伪装成书籍原文（两档方案防住了「伪装成社区」，没防住这个）。
+# IPTC 的词表恰好有**天然的一对**：
+#
+#     compositeWithTrainedAlgorithmicMedia   用生成式 AI **编辑 / 转换**过
+#     trainedAlgorithmicMedia                完全由生成式 AI **生成**
+#
+# 这一对正是本系统最需要的那条界线。词表由 IPTC 维护、C2PA 已采纳 ——
+# 引用它比自己发明一套更省事，也更容易被别人认出来。
+#
+# ⚠️ 这里**只取本系统用得上的四档**，不是词表全集（词表还有 negativeFilm /
+# print / screenCapture 等二十来个媒体场景的词，与本系统无关）。
+# 取子集是刻意的：**判据要窄**，宽了就会有人拿无关档位糊弄过去。
+DIGITAL_SOURCE_TYPES = (
+    "digitalCreation",                        # 人用**非生成式**工具创建
+    "digitalCapture",                         # 从真实来源采集（书里的原文摘录）
+    "compositeWithTrainedAlgorithmicMedia",   # 用生成式 AI 编辑过（**AI 转录的书**）
+    "trainedAlgorithmicMedia",                # 完全由生成式 AI 生成（**AI 归纳的 Context**）
+)
+
+# 默认档位：`add_artifact` 是**底层写原语**，调用方是「记一条事实」，默认取人创建。
+# AI 产出**必须显式声明** —— 这符合「AI 产出不得伪装成人」的方向。
+DIGITAL_SOURCE_DEFAULT = "digitalCreation"
+
+# 哪几档是 **AI 产出**。判据是「**必须**写明谁主张的」（见 `add_artifact` 的守卫）。
+#
+# 理由：AI 转录的东西，它的主张者**必须被指明** —— 是书作者，还是 AI 自己。
+# 留空就等于**系统替它立论**，而那正是 `§C2.0` 与上层「命名归人」同一条禁令。
+AI_SOURCES = (
+    "compositeWithTrainedAlgorithmicMedia",
+    "trainedAlgorithmicMedia",
+)
+
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime(TS_FORMAT)
+
+
+def now() -> str:
+    """当前时间戳（`TS_FORMAT`）。
+
+    公开给同仓库的其他层用 —— **时间格式只在这一处定义**。
+    别处自己 `strftime` 一份，就会出现两种格式，而它们在字符串排序下
+    恰好也能排，于是这件事直到跨年才会暴露。
+    """
+    return _now()
 
 
 class ScaffoldError(Exception):
@@ -153,6 +312,20 @@ CREATE TABLE IF NOT EXISTS artifact (
     state       TEXT NOT NULL,             -- 生命周期
     status      TEXT NOT NULL,             -- Evidence 状态；默认 unresolved
     origin      TEXT NOT NULL,             -- 产生者，可追溯（§C2.4 / #9）
+    -- ---- 来源与归因（2026-09-28）----------------------------------------
+    -- 三栏各答一个问题，**合成一个必然丢一个**：
+    --   digital_source_type  内容**怎么产生的**     （IPTC 词表，见上）
+    --   asserted_by          **谁主张的**           （PROV-O wasAttributedTo）
+    --   origin               **谁产生这条记录的**   （PROV-O wasGeneratedBy）
+    --
+    -- 书籍场景三栏各不相同：类型 = AI 转录、主张者 = 书作者、记录者 = 转录者。
+    -- 压成一栏就再也答不上「这条到底是书说的，还是 AI 说书说的」。
+    digital_source_type TEXT NOT NULL DEFAULT 'digitalCreation',
+    asserted_by TEXT,                      -- 人档默认取 origin；AI 档必填（见 add_artifact）
+    -- ---- 入层口（2026-09-28）--------------------------------------------
+    -- 「从哪个口进来的」。与 `digital_source_type` **不是一回事** —— 见常量区。
+    -- ⚠️ `staged` 的节点在过门之前**不许 activate**（见 activate() 的守卫）。
+    intake      TEXT NOT NULL DEFAULT 'direct',
     created_at  TEXT NOT NULL
 );
 
@@ -199,6 +372,28 @@ CREATE TABLE IF NOT EXISTS seq (
     name        TEXT PRIMARY KEY,
     n           INTEGER NOT NULL
 );
+
+-- 入层门（`§T4` 留白项 · 2026-09-28）。
+--
+-- 一次蒸馏 = 一个 `batch`。同一本书重蒸会拿到新的 batch，**旧的不会被覆盖** ——
+-- 于是「这本书蒸过几轮、每轮过没过门」是一条可查的事实，不是记忆。
+--
+-- ⚠️ 这张表**不是**「导入层的内容」—— 内容在 artifact 里。
+-- 它只记「这一条是从哪个口进来的、门过没过」。所以它答不了
+-- 「这条命题说了什么」，只答得了「这条命题能不能算数」。
+CREATE TABLE IF NOT EXISTS staging (
+    artifact_id TEXT PRIMARY KEY,
+    batch       TEXT NOT NULL,             -- 一次蒸馏一个批次号
+    source_uri  TEXT NOT NULL,             -- 蒸的是哪本书（绝对 URI）
+    gate_state  TEXT NOT NULL,             -- pending / passed / rejected
+    gate_by     TEXT,                      -- 谁过的门；未过为 NULL
+    gate_note   TEXT,                      -- 过门时的一句话，可空
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (artifact_id) REFERENCES artifact(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staging_batch ON staging(batch);
+CREATE INDEX IF NOT EXISTS idx_staging_gate  ON staging(gate_state);
 
 CREATE INDEX IF NOT EXISTS idx_rev_artifact ON revision(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_rel_from ON relation(from_id);
@@ -301,11 +496,32 @@ def add_artifact(
     content: dict,
     origin: str,
     state: str = "proposed",
+    digital_source_type: str = DIGITAL_SOURCE_DEFAULT,
+    asserted_by: str | None = None,
+    intake: str = "direct",
 ) -> str:
     """建一个 Artifact，并落它的第 1 个 revision。
 
     `state` 默认 `proposed` —— 机器产出的东西先落这里。
     转 `active` 只有 Arena 层的用户确认那一条路（`§C5`：未经确认不得写入 Scaffold）。
+
+    --- 来源与归因（2026-09-28）-----------------------------------------------
+
+    `digital_source_type` 说**内容怎么产生的**；`asserted_by` 说**谁主张的**；
+    `origin` 说**谁产生这条记录的**。三栏各答一个问题。
+
+    两条守卫：
+
+    1. **AI 档位必须写明 `asserted_by`。** AI 转录 / 生成的东西，它的主张者
+       必须被指明（书作者，或 AI 自己）。留空就等于**系统替它立论** ——
+       和上层「名字由人给」（B15）是同一条禁令，只是这里管的是「谁说的」。
+    2. `asserted_by` 缺省时**取 `origin`**。人档下这两者本来就是同一个 ——
+       用户提的主张就是用户记的。**AI 档不允许走到这条缺省**（守卫 1 会先拦）。
+
+    --- 入层口（2026-09-28）---------------------------------------------------
+
+    `intake="staged"` 的节点**在过门之前不许 activate**。但这里**不拦**它 ——
+    落 staging 这一步本来就要建节点，拦了就没法落。门在 `activate()` 那一端。
     """
     if state not in ARTIFACT_STATES:
         raise ScaffoldError(f"未知 state：{state}")
@@ -314,12 +530,29 @@ def add_artifact(
             "add_artifact 不得直接建 active 对象。"
             "active 只能由用户在确认环节授予（§C5「未经确认不得写入 Scaffold」）。"
         )
+    if intake not in INTAKE_CHANNELS:
+        raise ScaffoldError(f"未知 intake：{intake}（见 INTAKE_CHANNELS）")
+    if digital_source_type not in DIGITAL_SOURCE_TYPES:
+        raise ScaffoldError(
+            f"未知 digital_source_type：{digital_source_type} —— "
+            f"取值照 IPTC 词表，本系统只用这几档：{DIGITAL_SOURCE_TYPES}"
+        )
+    who = (asserted_by or "").strip()
+    if digital_source_type in AI_SOURCES and not who:
+        raise ScaffoldError(
+            f"{digital_source_type} 必须写明 asserted_by（谁主张的）。"
+            "AI 产出的东西主张者留空，等于系统替它立论 —— "
+            "是书作者就写书作者，是 AI 自己就写 AI。"
+        )
     aid = new_id(conn, type_)
     now = _now()
     conn.execute(
-        "INSERT INTO artifact (id, type, state, status, origin, created_at)"
-        " VALUES (?,?,?,?,?,?)",
-        (aid, type_, state, STATUS_DEFAULT, origin, now),
+        "INSERT INTO artifact"
+        " (id, type, state, status, origin, digital_source_type, asserted_by,"
+        "  intake, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (aid, type_, state, STATUS_DEFAULT, origin,
+         digital_source_type, who or origin, intake, now),
     )
     _append_revision(conn, aid, None, content, origin)
     conn.commit()
@@ -336,12 +569,40 @@ def get(conn: sqlite3.Connection, artifact_id: str) -> sqlite3.Row:
 
 
 def activate(conn: sqlite3.Connection, artifact_id: str, *, by: str) -> None:
-    """proposed → active。**唯一**入口，且必须写明是谁确认的。"""
+    """proposed → active。**唯一**入口，且必须写明是谁确认的。
+
+    --- 入层门守卫（2026-09-28）-----------------------------------------------
+
+    `intake='staged'` 的节点，**没过门就不许 active** —— 哪怕有人点名要确认它。
+
+    为什么这条要挡在**这里**而不是写在 `staging.py` 里：`staging.py` 挡的是
+    「走 staging 的人忘了过门」；挡不住「**压根不走 staging、直接建了再 activate**」。
+    只有落在 `active` 的唯一入口上，两条路才一起被挡。
+
+    ⚠️ 它挡不住的是什么，说清楚：调用方把 `intake` 填成 `direct` 就绕过去了。
+    那是**撒谎**，不是漏洞 —— 静态那半（B20）盯的就是「非 staging 模块里
+    出现导入档位的字面量」。两条一起才是完整的，形状同 B14（静态拦直笔 + 行为拦绕路）。
+    """
     row = get(conn, artifact_id)
     if row["state"] != "proposed":
         raise ScaffoldError(
             f"{artifact_id} 当前是 {row['state']}，只有 proposed 能被确认。"
         )
+    if row["intake"] == "staged":
+        gate = conn.execute(
+            "SELECT gate_state FROM staging WHERE artifact_id = ?", (artifact_id,)
+        ).fetchone()
+        if gate is None:
+            raise ScaffoldError(
+                f"{artifact_id} 是经入层口进来的（intake='staged'），"
+                "却没有 staging 记录 —— 门还没落，不能确认。"
+            )
+        if gate["gate_state"] != GATE_PASSED:
+            raise ScaffoldError(
+                f"{artifact_id} 的入层门还是 {gate['gate_state']!r}，不能确认。"
+                "导入层的东西必须先过门（`staging.gate()`）—— "
+                "门没过就 active，等于把没过眼的蒸馏产物当成已确认知识。"
+            )
     conn.execute(
         "UPDATE artifact SET state = 'active' WHERE id = ?", (artifact_id,)
     )
@@ -357,6 +618,14 @@ def _append_revision(
     conn: sqlite3.Connection, artifact_id: str,
     parent_rev: int | None, content: dict, author: str,
 ) -> int:
+    """内容落库的**唯一漏斗** —— 所以定位符的写入时守卫放在这里。
+
+    ⚠️ 为什么不在 `add_artifact()` 里验：那样只有「新建」被守住，
+    `revise()` 是一条**独立**的写入路径（B14 那条行为验证正是抓到了
+    「走 revise 的间接写静态看不见」）。放在漏斗上，两条路一起守。
+    """
+    if isinstance(content, dict) and pointer.POINTER_FIELD in content:
+        pointer.verify(content[pointer.POINTER_FIELD])
     cur = conn.execute(
         "INSERT INTO revision (artifact_id, parent_rev, content, author, created_at)"
         " VALUES (?,?,?,?,?)",
@@ -540,6 +809,42 @@ def reject_relation(conn: sqlite3.Connection, relation_id: int, *, by: str) -> N
                  {"relation": relation_id, "kind": row["kind"],
                   "origin": row["origin"]})
     conn.commit()
+
+
+def relation_ancestors(kind: str) -> list[str]:
+    """一条 kind 的祖先链（不含它自己），从近到远。
+
+    只走 `RELATION_PARENTS` 一层表 —— 它现在只有两条边、两层，
+    但写成循环是为了**将来加一条边时不用改这里**。
+    环由 `seen` 兜住（真出现环会停下并返回已走过的部分，不挂死）。
+    """
+    chain, seen = [], {kind}
+    cur = RELATION_PARENTS.get(kind)
+    while cur and cur not in seen:
+        chain.append(cur)
+        seen.add(cur)
+        cur = RELATION_PARENTS.get(cur)
+    return chain
+
+
+def is_primary_source(kind: str) -> bool:
+    """「这条边**能不能当原始来源用**」—— **唯一**判据。
+
+    ⚠️ 只读 `PRIMARY_SOURCE_KIND`，**不读** `quoted_from`。
+    引用是派生的弱特化，够不着来源这一档 —— 这就是 P5（Reference ≠ Derivation）
+    在代码里的样子。B17 盯着这个方向：**引用不许出现在原始来源的祖先链上**。
+    """
+    return kind == PRIMARY_SOURCE_KIND
+
+
+def pointer_of(conn: sqlite3.Connection, artifact_id: str) -> dict | None:
+    """这条对象指向外面哪个东西的哪一段；不指向外部就返回 `None`。
+
+    ⚠️ 多头时 `content_of()` 会直接拒绝（`§C10` 不替人挑版本）——
+    定位符也就读不出来。这是**对的**：两个分支可能指两个地方，
+    挑一个就是替用户做了一次判断。
+    """
+    return pointer.read(content_of(conn, artifact_id))
 
 
 # ---------------------------------------------------------------------------

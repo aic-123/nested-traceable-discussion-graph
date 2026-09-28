@@ -303,6 +303,14 @@ def promote_candidates(
                 "induction_version": INDUCER_VERSION,
             },
             origin=by,
+            # ⚠️ 这个节点是**上层归纳**的产物，必须**显式**记成 AI 生成。
+            # 底层原语的默认档位是 `digitalCreation`（人创建）—— 不显式改过来，
+            # AI 的产出就会被记成人的产出。那正是本仓库最防的一件事。
+            digital_source_type="trainedAlgorithmicMedia",
+            # 「谁主张的」= 批准这次归组的人。
+            # 注意它**不是**「谁命名的」—— 节点名此刻还是空的（`PENDING_NAME`），
+            # 命名由 `rename_context` 走另一条路。
+            asserted_by=by,
         )
         # ⚠️ 建完**立刻 activate**，理由要说清楚，因为它和「必须确认」看着冲突。
         #

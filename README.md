@@ -17,11 +17,56 @@
 | 文件 | 是什么 |
 |---|---|
 | `scaffold.py` | 读写原语：节点、边、版本、事件。**零第三方依赖**（只用 `json` / `sqlite3` / `datetime`） |
+| `pointer.py` | 引用定位符 `(uri, selector)` —— 照抄 **W3C Web Annotation**，**只存位置，不存正文** |
 | `upper.py` | 上层归纳本身 —— 数信号 → 提候选 → 建节点 → 命名 → 出视图 |
-| `checks.py` | 15 条否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` | 上一层的行为验证 —— 只依赖 `scaffold.py` 与标准库 |
-| `test_checks.py` | 证明那 15 条检查**不是空转**的 |
+| `staging.py` | 蒸馏**入层门** —— 导入层与社区层分开走；DeepRead 八种关系的**显式映射表** |
+| `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
+| `checks.py` | **21 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 21 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
+
+## 导入的与用户说的，走两个口
+
+同一个库里有两类东西，它们的**可变性不同** —— 这一点决定了它们要遵守的规矩也不同：
+
+| | 导入层（书里蒸出来的） | 社区层（用户自己说的） |
+|---|---|---|
+| 来源 | 外部 —— **书还在** | 内部 —— **不可再生** |
+| 出错代价 | 重蒸一遍 | **不可逆** |
+
+所以「不可变」那条约束**只管社区层**。导入层可以整层重建，于是入层门不必挡数量、
+只需挡质量。但这个「可整层重建」有前提，而它是**可查的**，不是一句设计意图：
+
+```python
+staging.orphan_edges(conn, batch)   # 社区层指进这一批的边
+staging.clear_batch(conn, batch=b)  # 有这种边就**默认拒绝**，force=True 才删
+```
+
+**没有跨层边 → 删掉这一批，社区层逐字段一致 → 可整层重建。**
+有 → 重建会撕开社区层 → 不许自动做，要人看过那份边清单再决定。
+
+门挡在**写 `active` 的唯一入口**上（`scaffold.activate()`），所以
+「不走 staging、直接建了再确认」这条路也过不去 —— 而不是只在 `staging.py` 里挡一下。
+
+### 引用只存位置，不存正文
+
+```python
+{"uri": "urn:isbn:9780000000000",
+ "selector": {"type": "TextQuoteSelector", "exact": "稀缺性来自供给的不可复制"}}
+```
+
+理由不是省空间，是**副本无法证明自己等于原文**：原文改了、撤了、换版本，
+副本不会跟着变，而读者看不出来。
+
+判据是**字段白名单**，不是长度限制 —— 白名单之外一个字段都放不进去，
+于是「顺手把正文也存一份」**没有地方可以发生**。
+
+⚠️ `exact` **允许**：它是定位所需的最小引文，属于 selector 的规定字段。
+两者的界在**字段身份**上，不在字数上。
+
+守卫接在 `scaffold._append_revision()` 上 —— 那是 `add_artifact()` 与 `revise()`
+**共用的唯一漏斗**。只接在前者上，后者就成了绕路（B14 那条行为验证正是这么抓到的）。
 
 ## 它不是什么
 
@@ -107,9 +152,12 @@
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 15 条否证检查
+python checks.py                      # 21 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
-python -m unittest test_checks        # 证明那 15 条检查不是空转
+python -m unittest test_pointer       # 定位符：只存位置，不存正文
+python -m unittest test_staging       # 入层门：不过门就进不了 active
+python -m unittest test_provenance    # 来源与归因：AI 产出不许伪装成人
+python -m unittest test_checks        # 证明那 21 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -118,7 +166,7 @@ python -m unittest test_checks        # 证明那 15 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 15 条，B1, B10, ... 无命中。
+否证检查全部通过：共 21 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

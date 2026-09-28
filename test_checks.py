@@ -32,6 +32,7 @@ import unittest
 from pathlib import Path
 
 import checks
+import scaffold
 
 ROOT = Path(__file__).parent
 
@@ -273,7 +274,8 @@ class TestEveryCheckFires(unittest.TestCase):
         # B14 / B15 同理（它们扫 `checks.UPPER`）：在 TestB14Fires / TestB15Fires。
         # B4 也是**限定范围**的（只扫 upper.py），所以这个探针也盖不到它 ——
         # 由 TestB4IsScopedToTheUpperLayer 单独钉。
-        needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15"}
+        needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
+                          "B16", "B17", "B18", "B19", "B20", "B21"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -691,6 +693,277 @@ class TestCheckRegistryShape(unittest.TestCase):
             self.assertIn(code, produced,
                           f"{code} 在 CHECKS 里，却没被 all_checks() 产出来 —— "
                           "它现在不在任何总账的覆盖范围里。")
+
+
+class TestB16Fires(unittest.TestCase):
+    """B16 查的是**集合关系**与「守卫在不在」，探针扫不到 —— 必须单独验。
+
+    它的判据不读源码文本，读的是 `scaffold` 的常量，所以验伪要**注入假常量**。
+    与 B8/B9/B12 那几条「探针盖不到」的检查同理，只是手法不同：
+    那几条要写靶文件，这条要传假集合。
+    """
+
+    def test_B16_fires_when_an_ai_kind_is_not_marked(self):
+        """漏一档 AI 档 —— 那一档的产出就不需要写明主张者。"""
+        hits = checks.check_ai_sources_require_attribution(
+            ai=("trainedAlgorithmicMedia",),     # 漏了 compositeWith...
+        )
+        self.assertTrue(hits, "漏了一档 AI 档，B16 却没反应")
+
+    def test_B16_fires_when_ai_sources_is_empty(self):
+        self.assertTrue(checks.check_ai_sources_require_attribution(ai=()))
+
+    def test_B16_fires_when_an_unknown_kind_is_listed(self):
+        hits = checks.check_ai_sources_require_attribution(
+            ai=("trainedAlgorithmicMedia",
+                "compositeWithTrainedAlgorithmicMedia",
+                "made_up_kind"),
+        )
+        self.assertTrue(hits)
+
+    def test_B16_fires_when_the_default_kind_is_also_ai(self):
+        """默认档同时算 AI 档 —— 每个走默认值的调用都会触发守卫，自相矛盾。"""
+        hits = checks.check_ai_sources_require_attribution(
+            ai=scaffold.AI_SOURCES + (scaffold.DIGITAL_SOURCE_DEFAULT,),
+        )
+        self.assertTrue(hits)
+
+    def test_B16_fires_when_the_guard_is_gone_from_the_code(self):
+        """常量对，但**没人拿它拦** —— 那等于没这条规矩。
+
+        拿一个不含 `add_artifact` 的文件当靶（`checks.py` 自己），必须报出来。
+        """
+        hits = checks.check_ai_sources_require_attribution(
+            target=Path(checks.__file__),
+        )
+        self.assertTrue(hits, "靶文件里没有 add_artifact，B16 却没报")
+
+    def test_B16_is_quiet_on_the_real_module(self):
+        """真模块上必须安静 —— 否则上面几条只是在验一个永远报错的检查。"""
+        self.assertEqual(checks.check_ai_sources_require_attribution(), [])
+
+
+class TestB17Fires(unittest.TestCase):
+    """B17 的判据是**层级自洽**，探针扫不到 —— 注入假层级来验。
+
+    ⚠️ 最要紧的是 `test_B17_fires_when_quotation_is_an_ancestor`：
+    它防的是「原始来源特化自引用」—— 那样引用就自动够得着来源这一档，
+    整条约束当场失效。
+    """
+
+    def test_B17_fires_when_the_primary_source_is_a_quotation(self):
+        self.assertTrue(
+            checks.check_primary_source_is_not_a_quotation(primary="quoted_from"))
+
+    def test_B17_fires_when_quotation_is_an_ancestor_of_the_primary_source(self):
+        hits = checks.check_primary_source_is_not_a_quotation(
+            parents={"quoted_from": "derived_from",
+                     "had_primary_source": "quoted_from"},   # ← 来源 ⊑ 引用
+        )
+        self.assertTrue(hits, "原始来源特化自引用，B17 却没反应")
+
+    def test_B17_fires_when_quotation_has_no_parent(self):
+        """把 quoted_from 从父类表删掉 —— 它成了平级 kind，谁都能拿它当来源。"""
+        hits = checks.check_primary_source_is_not_a_quotation(
+            parents={"had_primary_source": "derived_from"})
+        self.assertTrue(hits)
+
+    def test_B17_fires_on_a_dangling_kind(self):
+        hits = checks.check_primary_source_is_not_a_quotation(
+            parents={"quoted_from": "derived_from",
+                     "had_primary_source": "derived_from",
+                     "ghost_kind": "derived_from"},
+        )
+        self.assertTrue(hits)
+
+    def test_B17_is_quiet_on_the_real_module(self):
+        self.assertEqual(checks.check_primary_source_is_not_a_quotation(), [])
+
+    def test_B17_does_not_require_the_primary_source_to_be_top_level(self):
+        """**反向判据**：原始来源**可以**有父类 —— 不许把这条也报掉。
+
+        PROV-O 里 wasQuotedFrom / hadPrimarySource / wasRevisionOf
+        **三者都是** wasDerivedFrom 的子属性。若有人把判据写成
+        「原始来源必须无父类」，真模块会被误报 —— 这一条钉住那个方向。
+        """
+        self.assertEqual(
+            checks.check_primary_source_is_not_a_quotation(
+                parents={"quoted_from": "derived_from",
+                         "had_primary_source": "derived_from"},
+            ), [],
+        )
+
+
+class TestB18Fires(unittest.TestCase):
+    """B18 的判据是**定位符白名单**，探针扫不到 —— 注入假白名单来验。
+
+    ⚠️ 最要紧的是 `test_B18_fires_when_a_body_field_is_declared`：
+    它防的是「给 selector 加一个字段顺手把正文也存进去」——
+    那样仓库里就多了一份**无法证明自己等于原文**的副本。
+    """
+
+    def test_B18_fires_when_a_body_field_is_declared(self):
+        hits = checks.check_reference_stores_only_a_locator(
+            kinds=("TextQuoteSelector",),
+            fields={"TextQuoteSelector": (("exact", "body"), ("prefix",))},
+        )
+        self.assertTrue(hits, "selector 规定了 body 字段，B18 却没反应")
+
+    def test_B18_fires_when_the_kinds_and_the_fields_disagree(self):
+        """两边不同时维护 —— 加了一种 selector 却忘了给字段规定。"""
+        hits = checks.check_reference_stores_only_a_locator(
+            kinds=("TextQuoteSelector", "MySelector"),
+            fields={"TextQuoteSelector": (("exact",), ())},
+        )
+        self.assertTrue(hits)
+
+    def test_B18_fires_on_a_selector_name_that_is_not_the_w3c_shape(self):
+        hits = checks.check_reference_stores_only_a_locator(
+            kinds=("我的选择器",),
+            fields={"我的选择器": (("exact",), ())},
+        )
+        self.assertTrue(hits)
+
+    def test_B18_fires_when_the_pointer_field_is_a_body_field(self):
+        real = checks.pointer.POINTER_FIELD
+        try:
+            checks.pointer.POINTER_FIELD = "body"
+            hits = checks.check_reference_stores_only_a_locator()
+        finally:
+            checks.pointer.POINTER_FIELD = real
+        self.assertTrue(hits)
+
+    def test_B18_fires_when_the_guard_is_gone(self):
+        """拿 `checks.py` 当靶 —— 它里面没有 `verify()`，白名单就没人拿它拦。"""
+        hits = checks.check_reference_stores_only_a_locator(
+            target=ROOT / "checks.py")
+        self.assertTrue(hits, "找不到 verify()，B18 却没反应")
+
+    def test_B18_is_quiet_on_the_real_modules(self):
+        self.assertEqual(checks.check_reference_stores_only_a_locator(), [])
+
+
+class TestB19Fires(unittest.TestCase):
+    """B19 的判据是**分档完备**，探针扫不到 —— 注入假分档来验。
+
+    ⚠️ 最要紧的是 `test_B19_fires_when_a_kind_is_left_unclassified`：
+    它防的是「加了个类型忘了分档」—— 后果不是报错，是那个类型
+    **默认落在没人管的那一档上**，而这在 diff 里几乎看不出来。
+    """
+
+    def test_B19_fires_when_a_kind_is_left_unclassified(self):
+        hits = checks.check_node_kinds_are_fully_classified(
+            kinds=("Claim", "Evidence", "忘了分档的新类型"),
+            rules={"fixed": ("Claim", "Evidence")},
+            prefixes={"Claim": "claim", "Evidence": "evid", "忘了分档的新类型": "new"},
+        )
+        self.assertTrue(hits, "有类型没分档，B19 却没反应")
+
+    def test_B19_fires_when_a_kind_sits_in_two_buckets(self):
+        hits = checks.check_node_kinds_are_fully_classified(
+            kinds=("Claim",),
+            rules={"fixed": ("Claim",), "free": ("Claim",)},
+            prefixes={"Claim": "claim"},
+        )
+        self.assertTrue(hits, "一个类型落在两档里，B19 却没反应")
+
+    def test_B19_fires_when_a_prefix_is_missing(self):
+        """`new_id()` 直接 `_PREFIX[type_]` —— 缺一个会在**运行时**才炸。"""
+        hits = checks.check_node_kinds_are_fully_classified(
+            kinds=("Claim", "Evidence"),
+            rules={"fixed": ("Claim", "Evidence")},
+            prefixes={"Claim": "claim"},
+        )
+        self.assertTrue(hits)
+
+    def test_B19_fires_on_an_empty_bucket(self):
+        hits = checks.check_node_kinds_are_fully_classified(
+            kinds=("Claim",),
+            rules={"fixed": ("Claim",), "free": ()},
+            prefixes={"Claim": "claim"},
+        )
+        self.assertTrue(hits)
+
+    def test_B19_is_quiet_on_the_real_module(self):
+        self.assertEqual(checks.check_node_kinds_are_fully_classified(), [])
+
+
+class TestB20Fires(unittest.TestCase):
+    """B20 的判据是**门挡在哪**，探针扫不到 —— 注入假常量与假靶来验。
+
+    ⚠️ 最要紧的是 `test_B20_fires_when_the_gate_is_missing_from_activate`：
+    门只有挡在**写 active 的唯一入口**上才拦得住「不走 staging、直接建了再确认」。
+    """
+
+    def test_B20_fires_when_a_channel_is_missing(self):
+        hits = checks.check_imported_never_bypasses_the_gate(
+            channels=("direct",))
+        self.assertTrue(hits, "少了一个入层口，B20 却没反应")
+
+    def test_B20_fires_when_the_gate_states_are_incomplete(self):
+        hits = checks.check_imported_never_bypasses_the_gate(
+            channels=("direct", "staged"), states=("pending",), passed="passed")
+        self.assertTrue(hits)
+
+    def test_B20_fires_when_the_gate_is_missing_from_activate(self):
+        """拿 `checks.py` 当入口靶 —— 它里面没有 `activate()`，门就无处可挡。"""
+        hits = checks.check_imported_never_bypasses_the_gate(
+            entry_path=ROOT / "checks.py", write_scan=False)
+        self.assertTrue(hits, "入口里找不到 activate()，B20 却没反应")
+
+    def test_B20_fires_when_the_gate_file_is_missing(self):
+        hits = checks.check_imported_never_bypasses_the_gate(
+            gate_path=ROOT / "不存在.py", write_scan=False)
+        self.assertTrue(hits)
+
+    def test_B20_fires_when_the_staged_channel_is_not_used(self):
+        """`staging.py` 在那儿，却没走 `intake="staged"` —— 它只是**宣称**走那个口。"""
+        hits = checks.check_imported_never_bypasses_the_gate(
+            gate_path=ROOT / "pointer.py", write_scan=False)
+        self.assertTrue(hits)
+
+    def test_B20_is_quiet_on_the_real_modules(self):
+        self.assertEqual(checks.check_imported_never_bypasses_the_gate(), [])
+
+
+class TestB21Fires(unittest.TestCase):
+    """B21 的判据是**映射表显式**，探针扫不到 —— 注入假映射来验。
+
+    ⚠️ 最要紧的是 `test_B21_fires_when_an_unmapped_one_is_silently_filled`：
+    把 `None` 改成某个 kind 而不同时改声明 —— 那就是**静默兜住**，
+    之后那条边在库里长得完全正常，只是信息没了。
+    """
+
+    def test_B21_fires_when_a_name_is_missing_from_the_table(self):
+        hits = checks.check_distiller_mapping_is_explicit(
+            mapping={"supports": "supports"}, names=("supports", "refutes"))
+        self.assertTrue(hits)
+
+    def test_B21_fires_when_an_unmapped_one_is_silently_filled(self):
+        hits = checks.check_distiller_mapping_is_explicit(
+            mapping={"supports": "supports", "exemplifies": "refines"},
+            names=("supports", "exemplifies"),
+            unmapped=("exemplifies",),
+        )
+        self.assertTrue(hits, "声明说没对应，表里却填了 —— B21 没反应")
+
+    def test_B21_fires_on_the_generic_fallback(self):
+        """★ `related_to` 是那个「兜住一切」的选项 —— 映射表里不许出现它。"""
+        hits = checks.check_distiller_mapping_is_explicit(
+            mapping={"supports": "related_to"},
+            names=("supports",), unmapped=(),
+        )
+        self.assertTrue(hits, "拿 related_to 兜住，B21 却没反应")
+
+    def test_B21_fires_on_an_unknown_kind(self):
+        hits = checks.check_distiller_mapping_is_explicit(
+            mapping={"supports": "不存在的种类"},
+            names=("supports",), unmapped=(),
+        )
+        self.assertTrue(hits)
+
+    def test_B21_is_quiet_on_the_real_module(self):
+        self.assertEqual(checks.check_distiller_mapping_is_explicit(), [])
 
 
 class TestNoResidue(unittest.TestCase):
