@@ -21,10 +21,11 @@
 | `upper.py` | 上层归纳本身 —— 数信号 → 提候选 → 建节点 → 命名 → 出视图 |
 | `rules.py` | 结构规则集 —— `system validation` 的落地形态。判据只能是**已有结构量的合取**，且**没有能力写库** |
 | `staging.py` | 蒸馏**入层门** —— 导入层与社区层分开走；DeepRead 八种关系的**显式映射表** |
+| `contribute.py` | 社区贡献**七种粒度**的入口 —— 词表只在一张表里，入口签名里一个词表参数都没有 |
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
-| `checks.py` | **22 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 22 条检查**不是空转**的 |
+| `checks.py` | **23 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 23 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -189,6 +190,70 @@ def evaluate(signals: dict, *, rules: dict | None = None) -> dict:   # 没有 co
 `rule` 只能传**规则名**（字符串），必须命中 `RULES`，否则 `RuleError` ——
 于是「把模型判断当 promote 条件」这件事**传不进来**，不是「我们约定不传」。
 
+## 七种贡献粒度，入口不许要求你懂图结构
+
+一个人往讨论里能放的东西有七种。它们落成的形状**不一样** —— 有的建节点、有的只建边、
+有的只加版本：
+
+| 粒度 | 落成什么 | 落点 |
+|---|---|---|
+| `claim` | 一条 `Claim` | `proposed`，**等确认** |
+| `evidence` | `Evidence` + `supports` / `contradicts` / `qualifies` 边 | `active` |
+| `challenge` | `Counterargument` + `challenged_by` 边 | `active` |
+| `counterexample` | `Counterexample` + `contradicts` 边 | `active` |
+| `revision` | 版本表加一行，**不覆盖** | 状态不动 |
+| `connection` | `related_to` 边，**不新建节点** | `active` |
+| `context` | 一个新 `Topic` | `proposed`，**等确认** |
+
+调用方看到的是这个：
+
+```python
+contribute.claim(conn, text="A 导致 B", by="alice")
+contribute.evidence(conn, text="2019 年那项追踪研究", target="claim-0001", by="alice")
+contribute.challenge(conn, text="那个样本只覆盖一线城市", target="claim-0001", by="alice")
+contribute.connection(conn, left="claim-0001", right="claim-0002", by="alice")
+```
+
+**没有一个参数是词表** —— 没有 `kind=`、没有 `type_=`、没有 `state=`。
+
+这不是「约定别传」，是**签名上没得传**：七种粒度到
+(节点类型, 关系种类, 方向, 落点) 的映射**只出现在 `CONTRIBUTIONS` 这一张表里**。
+静态那半是 **B23**，行为那半是 `test_contribute.py`（31 条）。
+
+`connection` 是七种里唯一不新建节点的 —— 它落成 `relation` 表里的一行。
+那行有独立 `id`、有 `origin`、有 `state`，可以被推翻（`reject_relation` 改状态，
+**不删行**）。按 AIF，连接是**有身份、可被质疑**的东西，不是两个信息节点之间的一条直连边。
+
+### 为什么 `context` 不是上层那个 `Context`
+
+七种里的 `context` 与上层归纳建的 `Context` 节点**不是同一个东西**：
+
+| | 上层 `Context` | `contribute.context` |
+|---|---|---|
+| 谁建 | 只许 `upper.py`（`CONTROL_RULES` 的 `structural` 档） | 社区成员 |
+| 建的是什么 | 一批**已确认**节点的归组，名字留空 | 一个新**议题**（`Topic`） |
+| 免不免确认 | 免 —— 名字留空，系统一句话都没说 | **不免** —— 新议题是一条新断言 |
+
+所以 `CONTROL_RULES` 一个字没改，「上层节点不许被底层当命题用」那条边界也没动。
+`test_contribute.py` 里有一条用例跑完全部七种，断言库里**没有** `Context` 节点、
+也**没有** `clustered_into` 边 —— 这是单向性在贡献层的落点。
+B23 的 import 白名单（只有 `__future__` / `sqlite3` / `scaffold`，**不许 import `upper`**）
+是同一件事的静态那半。
+
+### 分档钉成双向的
+
+`§C2.5` 的四档表落到这一层是：**新建可被独立引用的对象必须确认，标注与关系默认生效。**
+B23 把它写成一条**双向**判据：
+
+```
+落点 == "proposed"   ⟺   类型在 §C2.5 第 2 档点名的名单里
+```
+
+双向是必须的，因为要拦的动作正好是**把该确认的改成默认生效**：
+把 `claim` 的落点从 `proposed` 改成 `active` 之后，库里看不出任何异常 ——
+节点照样有 id、照样能引用，只是「未确认的东西不许算数」在贡献入口上没了。
+只判单向的话，这一改一次都不会响。
+
 ## 早期阶段它是**休眠**的
 
 这是一个**可证伪的预言**，不是免责声明：
@@ -207,13 +272,14 @@ def evaluate(signals: dict, *, rules: dict | None = None) -> dict:   # 没有 co
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 22 条否证检查
+python checks.py                      # 23 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
 python -m unittest test_provenance    # 来源与归因：AI 产出不许伪装成人
 python -m unittest test_rules         # 规则集：判定一个字都没写库 / 合取不是析取
-python -m unittest test_checks        # 证明那 22 条检查不是空转
+python -m unittest test_contribute    # 七种贡献粒度逐个可建 / 空库也能建第一条
+python -m unittest test_checks        # 证明那 23 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -222,7 +288,7 @@ python -m unittest test_checks        # 证明那 22 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 22 条，B1, B10, ... 无命中。
+否证检查全部通过：共 23 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

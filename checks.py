@@ -25,6 +25,7 @@ docstring 为什么不扫，见 修订四。
 
 from __future__ import annotations
 
+import ast
 import io
 import re
 import sys
@@ -32,11 +33,12 @@ import tokenize
 from functools import partial
 from pathlib import Path
 
-# ⚠️ 本文件**只有八条检查** import 了被检查的模块（B16–B22），其余全是纯静态扫源码。
+# ⚠️ 本文件**只有九条检查** import 了被检查的模块（B16–B23），其余全是纯静态扫源码。
 # 理由：那几条查的是**词汇表定义的自洽性** —— 那是「规格」，读常量就是读规格，
 # 比用正则去抠源码里的字面量准得多（正则抠字面量改个格式就失效）。
-# 它们不引入运行时依赖：`pointer` / `scaffold` / `staging` / `rules` / `upper`
-# 都是本地模块，且只用标准库。
+# 它们不引入运行时依赖：`contribute` / `pointer` / `scaffold` / `staging` /
+# `rules` / `upper` 都是本地模块，且只用标准库。
+import contribute
 import pointer
 import rules
 import scaffold
@@ -1168,6 +1170,21 @@ def check_promotion_condition_is_structural(
     但 `select` 只收**规则名**，模型判断传不进来（`RuleError`）。
     真正绕得过去的是「把模型判断写进 `SIGNAL_VOCAB` 的某个信号名背后」，
     而那要改 `upper.count_signals()` —— 那是另一条会被 B14 盯上的路。
+
+    --- 口径修订二：模型入口按「包含」判，不按「以它开头」判（2026-09-28，当天）----
+
+    写 B23 时发现这条的口径太窄：`_RULES_MODEL_NAMES.match()` 只认
+    **名字以模型词开头**的标识符，于是
+
+        call_the_model(text)      ← 漏
+        ask_llm(prompt)           ← 漏
+        score_by_similarity(x)    ← 漏
+
+    这三种**一次都报不出来**，而它们恰恰是最常见的写法。`match` 抓到的是
+    `model_judge()` 这种把模型词放在开头的命名 —— 那不是真实代码的样子。
+
+    改 `search`。理由与 B6 的注释同一条：**否证检查漏报是致命的，误报只是吵。**
+    反向判据不受影响 —— 字面量里的模型名不是 `NAME` token（见 `_tokens_in`）。
     """
     source_path = source_path or (ROOT / "rules.py")
     is_real = source_path.name == "rules.py"
@@ -1291,7 +1308,8 @@ def check_promotion_condition_is_structural(
     for tok in _tokens_in(source_path):
         if tok.type != tokenize.NAME:
             continue
-        if _RULES_MODEL_NAMES.match(tok.string):
+        # ⚠️ `search` 不是 `match` —— 见下方「口径修订二」。
+        if _RULES_MODEL_NAMES.search(tok.string):
             flag("出现模型入口 —— promote 条件不许含模型判断（阶段 5 出口判据 ③）。"
                  "「模型觉得可以」读的是相似度之类的非结构量，B14 那条不变量当场就没了。",
                  tok.start[0])
@@ -1318,6 +1336,219 @@ def _function_body(path: Path, name: str):
             break
         body.append((n, text))
     return body, start
+
+
+def _ast_defs(path: Path) -> dict:
+    """该文件顶层的函数定义：名字 → `ast.FunctionDef` 节点。
+
+    为什么这里用 `ast` 而不是 B22 那套 token / 正则：这条要判的是**签名**——
+    「哪个参数带了默认值」在 token 流里是看不见的（得自己对齐 `=` 与参数位置）。
+    `ast` 是标准库，不引入新依赖（B7 盯着）。B22 那边继续用 token，
+    因为它的判据是「函数体里有没有算术」，那件事 token 就够，不必上 `ast`。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {n.name: n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _imported_tops(path: Path) -> list[str]:
+    """该文件 import 的顶层模块名（相对导入不计）。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out += [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            out.append((node.module or "").split(".")[0])
+    return sorted(set(out))
+
+
+_CONTRIB_IMPORT_WHITELIST = ("__future__", "sqlite3", "scaffold")
+_CONTRIB_MODEL_NAMES = re.compile(
+    r"(model|llm|embed|similar|predict|infer|neural|prompt)\w*", re.I)
+_CONTRIB_DIRECTIONS = ("to_target", "from_target", "between", None)
+# `§C2.5` 第 2 档**原文点名**的那几个：新建可被独立引用的对象必须确认。
+# 落 `proposed` 的类型必须落在这里面 —— 这一条是**刻意的硬编码**，
+# 理由与 B19 判据 6（上层边只有一条）和 `EXEMPT` 被钉住一样：
+# 分档一旦能自由漂，「哪几种贡献需要确认」就没有唯一答案了。
+_C25_MUST_CONFIRM = ("Topic", "Claim", "Subtopic")
+_CONTRIB_REQUIRED_FIELDS = ("type_", "relation", "direction", "state")
+
+
+def check_contribution_entrypoints_are_graph_free(
+    *, granularities: tuple | None = None, table: dict | None = None,
+    fields: tuple | None = None, states: tuple | None = None,
+    forbidden: tuple | None = None, actor: str | None = None,
+    artifact_types: tuple | None = None, relation_kinds: tuple | None = None,
+    source_path: Path | None = None,
+) -> list[tuple[str, int, str]]:
+    """社区贡献入口不许要求调用方懂图结构（阶段 4 的出口判据 ③）。
+
+    出口判据 ③ 原文是「**首次贡献者不需要理解 graph 结构**」。
+    这句话**默认不可执行** —— 它长得像一条体验要求，谁都能声称满足了。
+    可执行的形式只有一个：
+
+        七种粒度 → (节点类型, 关系种类, 方向, 落点) 的映射**只出现在一张常量表里**，
+        七个入口的签名里**一个词表参数都没有**。
+
+    于是「调用方自己挑一个关系种类」这件事**没有地方可以发生** ——
+    不是「约定别挑」，是签名上没得挑。这跟 B14「没有 `conn` 就没法写库」
+    是同一个做法：把纪律换成**能力上的不可能**。
+
+    判据：
+
+    1. ★ `CONTRIBUTIONS` 的键与 `GRANULARITIES` **相等**。
+       少一个是「有一种贡献做不出来」，多一个是「有一种没在判据里」。
+       这是「两集合相等」那条老手法的第五次使用。
+    2. 每条的字段 ⊆ `CONTRIBUTION_FIELDS`（**白名单**，同 `pointer.SELECTOR_FIELDS`），
+       且四个必填字段齐全。多一个字段（信心、来源、模型输出）就是让某一种贡献
+       携带别的东西，而它照样长得像一条贡献定义。
+    3. 取值封闭：`type_` ∈ `ARTIFACT_TYPES` ∪ {None}、`relation` / `choices` ⊆
+       `RELATION_KINDS`、`direction` ∈ 四个取值、`state` ∈ `CONTRIBUTION_STATES` ∪ {None}。
+       **不许在这一层发明词表** —— 加了新种类必须先过 B19。
+    4. ★ 分档**双向**钉住：`state == "proposed"` ⟺ 类型在 `§C2.5` 第 2 档的名单里。
+       把 `claim` 的落点改成默认生效，就等于把「未确认的东西不许算数」
+       从贡献入口上拿掉了 —— 而库里看不出任何异常。
+       只写单向会漏掉**正是这条要拦的那个动作**（实测：单向版一次都报不出来）。
+    5. 七个入口函数**逐个存在**；签名里**没有** `FORBIDDEN_PARAMS`；
+       `by` 必填且**没有默认值**（有默认值就是给「机器自己提交」留了条路）。
+    6. ★ import 白名单只有 `__future__` / `sqlite3` / `scaffold` ——
+       **尤其不许 import `upper`**。贡献层只写底层，归组是上层的事；
+       两者不在一个模块里，「上层的判断被写成底层的事实」在这条路上
+       就**没有入口**。这是单向性在贡献层的落点（B14 的邻居）。
+    7. 源码级（**看 token**）：全文没有模型入口名。
+       七种入口一个都不该调模型 —— 它们只把人的话落成结构。
+
+    ⚠️ 静态拦不住什么，说清楚（同 B14 / B18 / B20 / B22 的既有立场）：
+    它拦不住「有人绕开这七个函数，直接调 `scaffold.add_artifact`」——
+    那本来就是允许的（那是原语层）。这条盯的是**这一层自己的形状**：
+    入口不许把词表漏出去。
+    """
+    source_path = source_path or (ROOT / "contribute.py")
+    is_real = source_path.name == "contribute.py"
+    if is_real and not source_path.is_file():
+        return [("contribute.py", 1,
+                 "贡献入口层不在 —— 七种粒度就没落地，"
+                 "阶段 4 的出口判据 ① 与 ③ 都无从谈起。")]
+
+    granularities = contribute.GRANULARITIES if granularities is None else granularities
+    table = contribute.CONTRIBUTIONS if table is None else table
+    fields = contribute.CONTRIBUTION_FIELDS if fields is None else fields
+    states = contribute.CONTRIBUTION_STATES if states is None else states
+    forbidden = contribute.FORBIDDEN_PARAMS if forbidden is None else forbidden
+    actor = contribute.CONTRIBUTION_ACTOR if actor is None else actor
+    artifact_types = scaffold.ARTIFACT_TYPES if artifact_types is None else artifact_types
+    relation_kinds = scaffold.RELATION_KINDS if relation_kinds is None else relation_kinds
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, n: int = 1) -> None:
+        hits.append((source_path.name, n, msg))
+
+    # 1 两集合相等
+    if set(table) != set(granularities):
+        flag(f"CONTRIBUTIONS 与 GRANULARITIES 对不上"
+             f"（表里多：{sorted(set(table) - set(granularities))}；"
+             f"表里少：{sorted(set(granularities) - set(table))}）—— "
+             "「有哪几种贡献」只能有一个答案：少一个是做不出来，"
+             "多一个是没在判据里。")
+
+    # 2 / 3 / 4 每一条贡献定义
+    for name in sorted(table):
+        spec = table[name]
+        extra = sorted(set(spec) - set(fields))
+        if extra:
+            flag(f"贡献 {name!r} 多带了字段 {extra} —— 条目的字段是**白名单**"
+                 f"（只有 {list(fields)}）。多一个字段就是让某一种贡献携带别的东西"
+                 "（信心、来源、模型输出），而它照样长得像一条贡献定义。")
+        missing = sorted(set(_CONTRIB_REQUIRED_FIELDS) - set(spec))
+        if missing:
+            flag(f"贡献 {name!r} 少了必填字段 {missing} —— 缺了它，"
+                 "「这一种落成什么」就有一半没有答案。")
+
+        t = spec.get("type_")
+        if t is not None and t not in artifact_types:
+            flag(f"贡献 {name!r} 落成 {t!r}，它不是已知的节点类型 —— "
+                 "这一层不许发明词表，加类型必须先过 B19。")
+        kind = spec.get("relation")
+        if kind is not None and kind not in relation_kinds:
+            flag(f"贡献 {name!r} 用了 {kind!r}，它不是已知的关系种类。")
+        for c in spec.get("choices", ()):
+            if c not in relation_kinds:
+                flag(f"贡献 {name!r} 的可选边里有 {c!r}，它不是已知的关系种类。")
+        if kind is not None and spec.get("choices") and kind not in spec["choices"]:
+            flag(f"贡献 {name!r} 的默认边 {kind!r} 不在它自己的 choices 里 —— "
+                 "默认值必须是一个合法取值，否则默认那条路一调就抛。")
+        if spec.get("direction") not in _CONTRIB_DIRECTIONS:
+            flag(f"贡献 {name!r} 的 direction 是 {spec.get('direction')!r}，"
+                 f"不在 {list(_CONTRIB_DIRECTIONS)} 里。")
+        st = spec.get("state")
+        if st is not None and st not in states:
+            flag(f"贡献 {name!r} 的落点是 {st!r}，不在 {list(states)} 里。")
+        # ★ 分档**双向**钉住：`state == "proposed"` ⟺ 类型在 `§C2.5` 第 2 档的名单里。
+        #
+        # 为什么必须双向（这条是实测补的）：只写「落 proposed 的类型必须在名单里」
+        # 那个方向，把 `claim` 的落点从 `proposed` 改成 `active` **一次都报不出来** ——
+        # 而那一改正是这条要拦的动作：它把「未确认的东西不许算数」
+        # 从贡献入口上拿掉了，库里却看不出任何异常（节点照样有 id、照样能引用）。
+        if t is not None:
+            must_confirm = t in _C25_MUST_CONFIRM
+            if st == "proposed" and not must_confirm:
+                flag(f"贡献 {name!r} 落 `proposed`，但它的类型是 {t!r} —— "
+                     f"`§C2.5` 第 2 档点名的是 {list(_C25_MUST_CONFIRM)}。"
+                     "落点是分档的一部分：给一个不是新断言的东西加确认环节，"
+                     "等于让「确认」这个动作失去含义。")
+            elif must_confirm and st != "proposed":
+                flag(f"贡献 {name!r} 的类型是 {t!r}，它在 `§C2.5` 第 2 档的名单里，"
+                     f"落点却是 {st!r} —— 新建可被独立引用的对象**必须确认**。"
+                     "改成默认生效之后，「未确认的东西不许算数」就在这一层上没了，"
+                     "而库里看不出任何异常。")
+
+    # 5 七个签名（ast）
+    defs = _ast_defs(source_path)
+    for name in granularities:
+        node = defs.get(name)
+        if node is None:
+            flag(f"{name}() 不见了 —— 七种粒度就少一种。")
+            continue
+        pos = list(node.args.posonlyargs) + list(node.args.args)
+        kw = list(node.args.kwonlyargs)
+        params = [a.arg for a in pos + kw]
+        clash = sorted(set(params) & set(forbidden))
+        if clash:
+            flag(f"{name}() 收了词表参数 {clash} —— 调用方一旦能传它，"
+                 "这一层就退化成原语的薄包装，而它看起来还是七个漂亮的名字。")
+        if actor not in params:
+            flag(f"{name}() 没有 {actor} 参数 —— 谁提交的就记不下来，"
+                 "而「机器自己提交一条贡献」看起来和这一模一样。")
+            continue
+        with_default = [a.arg for a, d in
+                        zip(pos[-len(node.args.defaults):], node.args.defaults) if d]
+        with_default += [a.arg for a, d in zip(kw, node.args.kw_defaults) if d]
+        if actor in with_default:
+            flag(f"{name}() 的 {actor} 带了默认值 —— 留一个默认值，"
+                 "就等于给「机器自己提交」留了一条路，而那条路看起来很正常。")
+
+    # 6 import 白名单
+    for top in _imported_tops(source_path):
+        if top not in _CONTRIB_IMPORT_WHITELIST:
+            flag(f"import 了 {top!r} —— 贡献层的 import 白名单只有 "
+                 f"{list(_CONTRIB_IMPORT_WHITELIST)}。"
+                 "**尤其不许 import upper**：贡献进来的是事实，归组是上层的事，"
+                 "两者不在一个模块里，「上层判断被写成底层事实」才没有入口。")
+
+    # 7 模型入口（**看 token** —— 理由见 `_tokens_in`）
+    #
+    # ⚠️ 用 `search` 不用 `match`（口径修订，见 B22 的同款说明）：
+    # `match` 只认「名字以模型词开头」，于是 `call_the_model()` / `ask_llm()`
+    # 这类写法**一次都报不出来** —— 而它们恰恰是最常见的写法。
+    # 否证检查漏报是致命的（B6 的注释里写得很清楚），所以这里按「包含」判。
+    for tok in _tokens_in(source_path):
+        if tok.type == tokenize.NAME and _CONTRIB_MODEL_NAMES.search(tok.string):
+            flag(f"出现模型入口 {tok.string!r} —— 七种入口一个都不该调模型，"
+                 "它们只把人的话落成结构。调模型的那一层是上层的归组，不是这一层。",
+                 tok.start[0])
+    return hits
 
 
 def all_checks():
@@ -1362,6 +1593,8 @@ def all_checks():
            "§T4 留白 · 2026-09-28", check_distiller_mapping_is_explicit)
     yield ("B22", "promote 条件不许含模型判断（判据只能是结构量的合取）",
            "§C2.5 第 3 档 · 2026-09-28", check_promotion_condition_is_structural)
+    yield ("B23", "贡献入口不许要求调用方懂图结构（映射只在一张表里，签名无词表）",
+           "§C2.5 · 2026-09-28", check_contribution_entrypoints_are_graph_free)
 
 
 def main() -> int:

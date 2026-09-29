@@ -1,4 +1,4 @@
-"""`checks.py` 自己的测试 —— 证明 B1–B22 **不是空转**。
+"""`checks.py` 自己的测试 —— 证明 B1–B23 **不是空转**。
 
 --- 为什么会有这个文件 -----------------------------------------------------
 
@@ -274,8 +274,11 @@ class TestEveryCheckFires(unittest.TestCase):
         # B14 / B15 同理（它们扫 `checks.UPPER`）：在 TestB14Fires / TestB15Fires。
         # B4 也是**限定范围**的（只扫 upper.py），所以这个探针也盖不到它 ——
         # 由 TestB4IsScopedToTheUpperLayer 单独钉。
+        # B23 同理（它只扫 `contribute.py`）：在 TestB23Fires ——
+        # 喂 `_tmp_probe_zzz.py` 到不了它。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
-                          "B16", "B17", "B18", "B19", "B20", "B21", "B22"}
+                          "B16", "B17", "B18", "B19", "B20", "B21", "B22",
+                          "B23"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -1022,6 +1025,26 @@ def _said(hits: list, phrase: str) -> list:
     return [h for h in hits if phrase in h[2]]
 
 
+def _b23_probe(source: str, **kw) -> list:
+    """把 source 写成临时 `.py` 当 **B23 的源码靶**，跑完删掉。
+
+    与 `_b22_probe` 同形、同理由：B23 只扫 `contribute.py` 一个文件，
+    `_scan_with_temp_py()` 喂的是 `_tmp_probe_zzz.py`，**到不了它**。
+
+    ⚠️ 探针只用来验**签名 / import / 模型入口**那几条（它们读源码）。
+    表那几条读的是 `contribute.CONTRIBUTIONS`，走 `table=` 参数注入 ——
+    探针文件里写一份假表不会被读到，写了也没用。
+    """
+    probe = ROOT / "_tmp_probe_zzz.py"
+    _clean_probes()
+    probe.write_text(source, encoding="utf-8")
+    try:
+        return checks.check_contribution_entrypoints_are_graph_free(
+            source_path=probe, **kw)
+    finally:
+        _clean_probes()
+
+
 # 一份**形状完整**的探针骨架：四个判定函数都在。
 # 这样「只报我要验的那一处」才验得准 —— 缺一个函数 B22 会另报一笔「找不到 xxx()」。
 _RULES_PROBE = (
@@ -1182,6 +1205,22 @@ class TestB22Fires(unittest.TestCase):
         hits = _b22_probe("import llm\n" + _RULES_PROBE)
         self.assertTrue(_said(hits, "模型入口"), hits)
 
+    def test_B22_fires_on_a_model_entry_that_does_not_start_with_a_model_word(self):
+        """★ 口径修订二：按「包含」判，不按「以模型词开头」判。
+
+        原来用 `match`，于是 `call_the_model()` / `ask_llm()` 这类**最常见的写法**
+        一次都报不出来 —— 只有 `model_judge()` 这种把模型词放开头的命名才抓得到，
+        而那不是真实代码的样子。**漏报比误报致命**（同 B6 的取舍）。
+        """
+        for name in ("call_the_model", "ask_llm", "score_by_similarity"):
+            hits = _b22_probe(_RULES_PROBE + f"\n{name}(1)\n")
+            self.assertTrue(_said(hits, "模型入口"), f"{name} 漏了：{hits}")
+
+    def test_B22_does_not_fire_on_a_name_that_merely_contains_llm_letters(self):
+        """反向：**不含**模型词的普通名字不许误报（否则真话也会被当违规）。"""
+        hits = _b22_probe(_RULES_PROBE + "\nrealm = 1\nall_my = 2\n")
+        self.assertEqual(_said(hits, "模型入口"), [])
+
     def test_B22_fires_on_a_database_entry(self):
         """★ 判定必须**没有能力写库** —— 连连接对象都不许出现。"""
         hits = _b22_probe(_RULES_PROBE + "\nconn = 1\n")
@@ -1222,6 +1261,218 @@ class TestB22Fires(unittest.TestCase):
 
     def test_B22_is_quiet_on_the_real_module(self):
         self.assertEqual(checks.check_promotion_condition_is_structural(), [])
+
+
+class TestB23Fires(unittest.TestCase):
+    """B23 的判据是**入口层的形状**，探针扫不到 —— 注入假映射表 / 假源码来验。
+
+    ⚠️ 最要紧的四条：
+
+    * `test_B23_fires_when_an_entry_takes_a_vocabulary_parameter` ——
+      签名里出现 `kind=` 的那一刻，这一层就退化成原语的薄包装，
+      而它看起来还是七个漂亮的名字；
+    * `test_B23_fires_when_the_entry_layer_imports_the_upper_layer` ——
+      单向性在贡献层的落点：一旦 import 了 `upper`，
+      「上层的判断被写成底层的事实」就有了一条路；
+    * `test_B23_fires_when_an_assertion_lands_without_confirmation` ——
+      把 `claim` 的落点改成默认生效，分档就在这一层上没了；
+    * `test_B23_does_not_fire_on_prose_that_names_a_model` ——
+      **反向判据**。写在字面量里的模型名不是模型入口。
+    """
+
+    # 真实的形状原样喂进去，只改一处 —— 这样「报的是不是那一处」才验得准。
+    _GRANS = ("claim", "evidence", "challenge", "counterexample",
+              "revision", "connection", "context")
+    _FIELDS = ("type_", "relation", "choices", "direction", "target_types", "state")
+    _STATES = ("proposed", "active")
+    _FORBIDDEN = ("kind", "type", "type_", "state", "relation")
+    _ARTIFACT_TYPES = ("Topic", "Claim", "Evidence", "Counterargument",
+                       "Counterexample")
+    _RELATION_KINDS = ("supports", "contradicts", "qualifies", "challenged_by",
+                       "related_to")
+
+    @staticmethod
+    def _table(**overrides) -> dict:
+        base = {
+            "claim": {"type_": "Claim", "relation": None, "direction": None,
+                      "state": "proposed"},
+            "evidence": {"type_": "Evidence", "relation": "supports",
+                         "choices": ("supports", "contradicts", "qualifies"),
+                         "direction": "to_target", "target_types": ("Claim",),
+                         "state": "active"},
+            "challenge": {"type_": "Counterargument", "relation": "challenged_by",
+                          "choices": ("challenged_by",), "direction": "from_target",
+                          "target_types": ("Claim",), "state": "active"},
+            "counterexample": {"type_": "Counterexample", "relation": "contradicts",
+                               "choices": ("contradicts",),
+                               "direction": "to_target",
+                               "target_types": ("Claim",), "state": "active"},
+            "revision": {"type_": None, "relation": None, "direction": None,
+                         "state": None},
+            "connection": {"type_": None, "relation": "related_to",
+                           "choices": ("related_to",), "direction": "between",
+                           "state": "active"},
+            "context": {"type_": "Topic", "relation": None, "direction": None,
+                        "state": "proposed"},
+        }
+        base.update(overrides)
+        return base
+
+    def _run(self, **kw):
+        args = dict(granularities=self._GRANS, table=self._table(),
+                    fields=self._FIELDS, states=self._STATES,
+                    forbidden=self._FORBIDDEN, actor="by",
+                    artifact_types=self._ARTIFACT_TYPES,
+                    relation_kinds=self._RELATION_KINDS)
+        args.update(kw)
+        return checks.check_contribution_entrypoints_are_graph_free(**args)
+
+    # --- 映射表 -----------------------------------------------------------
+
+    def test_B23_fires_when_a_granularity_is_missing_from_the_table(self):
+        table = self._table()
+        del table["counterexample"]
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "CONTRIBUTIONS 与 GRANULARITIES 对不上"), hits)
+
+    def test_B23_fires_when_the_table_grows_a_granularity_nobody_declared(self):
+        hits = self._run(table=self._table(
+            upvote={"type_": "Vote", "relation": None, "direction": None,
+                    "state": "active"}))
+        self.assertTrue(_said(hits, "对不上"), hits)
+
+    def test_B23_fires_when_an_entry_carries_an_extra_field(self):
+        """条目多一个字段（信心、来源、模型输出），而它照样长得像一条贡献定义。"""
+        table = self._table()
+        table["claim"] = {**table["claim"], "confidence": "high"}
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "多带了字段"), hits)
+
+    def test_B23_fires_when_an_entry_invents_a_node_type(self):
+        table = self._table()
+        table["context"] = {**table["context"], "type_": "Scaffold"}
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "不是已知的节点类型"), hits)
+
+    def test_B23_fires_when_an_entry_invents_a_relation_kind(self):
+        table = self._table()
+        table["connection"] = {**table["connection"], "relation": "similar_to",
+                               "choices": ("similar_to",)}
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "不是已知的关系种类"), hits)
+
+    def test_B23_fires_when_the_default_edge_is_not_one_of_its_choices(self):
+        """默认值必须是一个合法取值，否则默认那条路一调就抛。"""
+        table = self._table()
+        table["evidence"] = {**table["evidence"], "relation": "refines"}
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "不在它自己的 choices 里"), hits)
+
+    def test_B23_fires_when_an_assertion_lands_without_confirmation(self):
+        """★ 把 `claim` 的落点改成默认生效 —— 分档就在这一层上没了。
+
+        这是本条检查最该拦住的一处：库里看不出任何异常，
+        节点照样有 id、照样能引用，只是「未确认的东西不许算数」失效了。
+
+        ⚠️ 这条用例同时钉住了**双向**：只写「落 proposed 的类型必须在名单里」
+        那个方向，这一改**一次都报不出来**（实测：单向版在这里返回 `[]`）。
+        """
+        table = self._table()
+        table["claim"] = {**table["claim"], "state": "active"}
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "必须确认"), hits)
+
+    def test_B23_fires_when_a_non_assertion_is_given_a_confirmation_step(self):
+        """反方向也要报：给一个**不是新断言**的东西加确认环节，
+        等于让「确认」这个动作失去含义。"""
+        table = self._table()
+        table["counterexample"] = {**table["counterexample"], "state": "proposed"}
+        hits = self._run(table=table)
+        self.assertTrue(_said(hits, "第 2 档点名的是"), hits)
+
+    # --- 签名 / import / 模型入口（探针） -----------------------------------
+
+    def test_B23_fires_when_an_entry_takes_a_vocabulary_parameter(self):
+        src = ("def claim(conn, *, text, kind, by):\n    return None\n")
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertTrue(_said(hits, "收了词表参数"), hits)
+
+    def test_B23_fires_when_an_entry_has_no_actor(self):
+        src = "def claim(conn, *, text):\n    return None\n"
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertTrue(_said(hits, "没有 by 参数"), hits)
+
+    def test_B23_fires_when_the_actor_has_a_default(self):
+        """留一个默认值，就等于给「机器自己提交」留了一条路。"""
+        src = "def claim(conn, *, text, by='system'):\n    return None\n"
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertTrue(_said(hits, "带了默认值"), hits)
+
+    def test_B23_fires_when_an_entry_disappears(self):
+        src = "def claim(conn, *, text, by):\n    return None\n"
+        hits = _b23_probe(src, granularities=("claim", "connection"),
+                          table={"claim": {}, "connection": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertTrue(_said(hits, "不见了"), hits)
+
+    def test_B23_fires_when_the_entry_layer_imports_the_upper_layer(self):
+        """★ 单向性在贡献层的落点 —— import 白名单。"""
+        src = ("import scaffold\n"
+               "import upper\n"
+               "def claim(conn, *, text, by):\n    return None\n")
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertTrue(_said(hits, "import 了"), hits)
+
+    def test_B23_fires_when_a_model_entry_appears(self):
+        src = ("import scaffold\n"
+               "def claim(conn, *, text, by):\n"
+               "    return call_the_model(text)\n")
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertTrue(_said(hits, "出现模型入口"), hits)
+
+    # --- 反向判据 ---------------------------------------------------------
+
+    def test_B23_does_not_fire_on_prose_that_names_a_model(self):
+        """**反向判据**：写在字面量里的模型名不是模型入口。
+
+        它挡的是「把正文改掉才过检」那条路 —— 那正是 `_tokens_in` 存在的理由
+        （字符串与 f-string 的正文根本不是 `NAME` token）。
+        """
+        src = ("import scaffold\n"
+               "def claim(conn, *, text, by):\n"
+               "    note = 'the model and the llm agree; prompt it'\n"
+               "    return note\n")
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertEqual([h for h in hits if "模型入口" in h[2]], [])
+
+    def test_B23_does_not_fire_on_a_future_annotation_import(self):
+        """`from __future__ import annotations` 在白名单里 —— 它不是外部依赖。"""
+        src = ("from __future__ import annotations\n"
+               "import sqlite3\n"
+               "import scaffold\n"
+               "def claim(conn, *, text, by):\n    return None\n")
+        hits = _b23_probe(src, granularities=("claim",), table={"claim": {}},
+                          artifact_types=(), relation_kinds=())
+        self.assertEqual([h for h in hits if "import 了" in h[2]], [])
+
+    def test_B23_fires_when_the_entry_layer_file_is_missing(self):
+        """入口层文件不在 —— 七种粒度就没落地，判据 ① 与 ③ 都无从谈起。
+
+        靶取一个**名字叫 `contribute.py` 但不存在**的路径。
+        """
+        hits = checks.check_contribution_entrypoints_are_graph_free(
+            source_path=ROOT / "不存在的目录" / "contribute.py")
+        self.assertTrue(_said(hits, "贡献入口层不在"), hits)
+
+    def test_B23_is_quiet_on_the_real_module(self):
+        self.assertEqual(
+            checks.check_contribution_entrypoints_are_graph_free(), [])
 
 
 class TestNoResidue(unittest.TestCase):

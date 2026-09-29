@@ -21,10 +21,11 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | `upper.py` | The upper induction layer itself — count signals → propose → promote → name → view |
 | `rules.py` | The structural rule set — what `system validation` actually means. Criteria are **conjunctions of existing structural counts**, and the module **has no ability to write** |
 | `staging.py` | The distillation **intake gate** — imported and community layers take different doors; an **explicit mapping table** for DeepRead's eight relations |
+| `contribute.py` | Entry points for the **seven contribution granularities** — the vocabulary lives in one table, and no entry signature takes a vocabulary parameter |
 | `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
-| `checks.py` | **22 falsification checks. Each one is executable**, not an adjective in a doc |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
-| `test_checks.py` | Proves those 22 checks **aren't vacuous** |
+| `checks.py` | **23 falsification checks. Each one is executable**, not an adjective in a doc |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
+| `test_checks.py` | Proves those 23 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -139,6 +140,57 @@ def evaluate(signals: dict, *, rules: dict | None = None) -> dict:   # no conn
 
 `rule` accepts only a **rule name** (a string) that must hit `RULES`, otherwise `RuleError` — so "use the model's judgement as a promote condition" **cannot be passed in**, rather than "we agreed not to".
 
+## Seven contribution granularities, and an entry layer that never asks you about graph structure
+
+There are seven things a person can put into a discussion. They do **not** land in the same shape — some create a node, some only an edge, one only adds a version:
+
+| Granularity | What it becomes | Where it lands |
+|---|---|---|
+| `claim` | a `Claim` | `proposed`, **awaits confirmation** |
+| `evidence` | `Evidence` + a `supports` / `contradicts` / `qualifies` edge | `active` |
+| `challenge` | `Counterargument` + a `challenged_by` edge | `active` |
+| `counterexample` | `Counterexample` + a `contradicts` edge | `active` |
+| `revision` | one row in the version table, **never an overwrite** | state unchanged |
+| `connection` | a `related_to` edge, **no new node** | `active` |
+| `context` | a new `Topic` | `proposed`, **awaits confirmation** |
+
+Here is what the caller sees:
+
+```python
+contribute.claim(conn, text="A causes B", by="alice")
+contribute.evidence(conn, text="the 2019 cohort study", target="claim-0001", by="alice")
+contribute.challenge(conn, text="that sample only covers tier-one cities", target="claim-0001", by="alice")
+contribute.connection(conn, left="claim-0001", right="claim-0002", by="alice")
+```
+
+**Not one parameter is vocabulary** — no `kind=`, no `type_=`, no `state=`.
+
+That is not "we agreed not to pass it"; there is **nothing to pass**. The mapping from the seven granularities to (node type, relation kind, direction, landing) lives in **one table**, `CONTRIBUTIONS`. The static half of that is **B23**; the behavioural half is `test_contribute.py` (31 tests).
+
+`connection` is the only one that creates no node — it lands as a row in the `relation` table. That row has its own `id`, its own `origin`, its own `state`, and it can be overturned (`reject_relation` flips the state, **it does not delete the row**). Per AIF a connection is something **with identity, open to challenge**, not a direct edge between two information nodes.
+
+### Why `context` is not the upper-layer `Context`
+
+The `context` granularity and the `Context` node the upper layer induces are **not the same thing**:
+
+| | Upper-layer `Context` | `contribute.context` |
+|---|---|---|
+| Who creates it | only `upper.py` (the `structural` tier of `CONTROL_RULES`) | a community member |
+| What it is | a grouping of **already-confirmed** nodes, name left blank | a new **topic** (`Topic`) |
+| Confirmation-exempt | yes — the name is blank, so the system said nothing | **no** — a new topic is a new assertion |
+
+So `CONTROL_RULES` is untouched, and so is the boundary "an upper-layer node may not be mistaken for a lower-layer proposition". One test in `test_contribute.py` runs all seven and asserts the store contains **no** `Context` node and **no** `clustered_into` edge — that is the one-way constraint landing at the contribution layer. B23's import whitelist (`__future__` / `sqlite3` / `scaffold` only, **`upper` forbidden**) is the static half of the same thing.
+
+### The tier is pinned in both directions
+
+`§C2.5`'s four-tier table reduces, at this layer, to: **newly created independently-referenceable objects must be confirmed; annotations and relations take effect by default.** B23 writes that as a **two-way** criterion:
+
+```
+landing == "proposed"   ⟺   the type is one of the §C2.5 tier-2 names
+```
+
+Two-way is necessary because the action to block is precisely **turning a must-confirm into a takes-effect-by-default**: after changing `claim`'s landing from `proposed` to `active`, nothing in the store looks wrong — the node still has an id, is still referenceable, and only "unconfirmed things do not count" has quietly gone from the entry layer. A one-way check never fires on that change.
+
 ## On a young corpus it is **dormant**
 
 This is a **falsifiable prediction**, not a disclaimer:
@@ -157,13 +209,14 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 22 falsification checks
+python checks.py                      # the 23 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
 python -m unittest test_pointer       # locators: position only, never the body
 python -m unittest test_staging       # intake gate: no gate, no `active`
 python -m unittest test_provenance    # provenance: AI output may not masquerade as human
 python -m unittest test_rules         # rule set: nothing written / conjunction ≠ disjunction
-python -m unittest test_checks        # proves those 22 checks aren't vacuous
+python -m unittest test_contribute    # seven granularities, each creatable / empty store too
+python -m unittest test_checks        # proves those 23 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:
@@ -172,7 +225,7 @@ python -m unittest test_checks        # proves those 22 checks aren't vacuous
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 22 条，B1, B10, ... 无命中。
+否证检查全部通过：共 23 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` skips 7 tests** — output is `OK (skipped=7)`. This is **intentional**:
