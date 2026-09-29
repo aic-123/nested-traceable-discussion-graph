@@ -25,9 +25,10 @@
 | `candidates.py` | **候选关系** —— AI 提的边进得了库，**进不了读数**。入口签名里没有 `state` |
 | `views.py` | **物化视图** —— 局部展开的**纯读缓存**（CQRS read model）。除了视图表，一句写语句都没有 |
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
-| `checks.py` | **25 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 25 条检查**不是空转**的 |
+| `stop.py` | **停止条件** —— 拿 `policy` 的门槛判四件事。**只判不执行**：一句写语句都没有，四个动作都是应用层的开关 |
+| `checks.py` | **26 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 26 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -371,6 +372,81 @@ views.clear(conn)                       # 删光全部视图 —— 零损失
 | 可重建 | 是（幂等） | 否（重建结果可能不同） |
 | 判据 | 重建后 lower 快照一致 | 依据边不得丢 |
 
+## 停止条件是**只判不执行**的
+
+四件事各有一条线，过线就该停下来看看。线在 `policy.py` 里，**可变动**：
+
+```python
+POLICY = {
+    "import_to_contribution_ceiling": 10,   # 导入 : 贡献 的上限
+    "books_without_effect":            3,   # 连续几本书蒸完没有任何变化
+    "staging_backlog_limit":          50,   # 没过门的积压上限
+}
+```
+
+`stop.py` 拿这些线判四件事，返回**该做什么**，但**不做**：
+
+```python
+import stop
+for finding in stop.judge(conn):
+    print(finding["state"], finding["condition"], finding["action"])
+```
+
+```
+triggered  import_dominates     pause_import
+clear      staging_backlog      None
+not_judged books_have_no_effect None
+not_judged unfaithful_import    None
+```
+
+四个动作（暂停导入 / 停书籍路线 / 暂停蒸馏 / 回退批次）**都是应用层的开关**。
+这一层给的是「该做什么」，不是「已经做了什么」——
+所以它**一句写语句都没有**（B26 判据 7 静态钉着）。
+
+### 三种状态，不是两种
+
+| 状态 | 意思 |
+|---|---|
+| `triggered` | 过线了，该做动作 |
+| `clear` | 判了，没过线 |
+| `not_judged` | **判不了**（缺输入 / 没有分母）—— **不等于**「没过线」 |
+
+压成两态会出真问题。最要紧的一处是**冷启动**：
+那时社区贡献是 0，「导入 : 贡献」没有分母。按比值算，
+0 贡献会让任何导入量都过线 —— 冷启动第一步就被自己掐死了
+（而冷启动的第一步本来就是导入：先把书蒸进来才有得讨论）。
+
+同一种「没事」也分两种，不能混：
+
+```python
+stop.judge(conn)                                # → not_judged：还没人查过
+stop.judge(conn, declared={"unfaithful": []})   # → clear：查过了，没问题
+```
+
+一个要去查，一个可以放心。混成一个状态之后，
+**一件从没做过的事会被报成一件做过且合格的事**。
+
+### 两件事要外部输入
+
+四件事里只有两件是本仓库自己算得出的：
+
+| 条件 | 数什么 |
+|---|---|
+| 导入压过贡献 | 数 `artifact`（`intake='staged'` 对社区贡献） |
+| staging 积压 | 数 `staging` 里 `pending` 的 |
+| 连续几本书没变化 | **跨批次历史** —— 本仓不存，调用方给 |
+| 某个导入节点「书里没有」 | **人核对原文的结果** —— 调用方给 |
+
+后两件经 `declared` 传进来，传的**是观测量不是结论**：
+「每本书有没有带来变化」由调用方给，**连续几本**由这一层自己数；
+「哪些节点有问题」由调用方给，**该回退哪几批**由这一层自己查。
+
+### 与观测点的分工
+
+`§八` 把 P7 拆成两栏：**观测点只记**（不得与任何数比较），**`POLICY` 只触发动作**。
+`observe()` 是「只记」那一半（纯读、不做任何比较），`judge()` 是过门槛那一半。
+两半都**不碰内容结构**，观测量也不进 `upper.COUNT_SIGNALS`（B26 判据 5 钉着）。
+
 ## 早期阶段它是**休眠**的
 
 这是一个**可证伪的预言**，不是免责声明：
@@ -389,7 +465,7 @@ views.clear(conn)                       # 删光全部视图 —— 零损失
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 25 条否证检查
+python checks.py                      # 26 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
@@ -398,7 +474,8 @@ python -m unittest test_rules         # 规则集：判定一个字都没写库 
 python -m unittest test_contribute    # 七种贡献粒度逐个可建 / 空库也能建第一条
 python -m unittest test_candidates    # 候选边不进读数 / 只有两条通路能把它变算数
 python -m unittest test_views         # 视图是缓存：重建幂等 / 重建删光都不动底层
-python -m unittest test_checks        # 证明那 25 条检查不是空转
+python -m unittest test_stop          # 停止条件只判不执行 / 判不了 ≠ 未触发
+python -m unittest test_checks        # 证明那 26 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -407,7 +484,7 @@ python -m unittest test_checks        # 证明那 25 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 24 条，B1, B10, ... 无命中。
+否证检查全部通过：共 26 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

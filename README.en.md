@@ -25,9 +25,10 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | `candidates.py` | **Candidate relations** — an edge the AI proposes gets into the store but **not into any reading**. No `state` in the entry signature |
 | `views.py` | **Materialized views** — local expansion as a **pure read cache** (CQRS read model). Outside the view table it contains not a single write statement |
 | `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
-| `checks.py` | **25 falsification checks. Each one is executable**, not an adjective in a doc |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
-| `test_checks.py` | Proves those 25 checks **aren't vacuous** |
+| `stop.py` | **Stop conditions** — judges four things against `policy`'s lines. **Judges only, never acts**: not a single write statement, and all four actions belong to the application layer |
+| `checks.py` | **26 falsification checks. Each one is executable**, not an adjective in a doc |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
+| `test_checks.py` | Proves those 26 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -285,6 +286,71 @@ All three exit criteria are **executable**:
 | Rebuildable | yes (idempotent) | no (a rebuild may differ) |
 | Criterion | lower-layer snapshot unchanged | evidence edges must not be lost |
 
+## Stop conditions **judge, and never act**
+
+Four things each have a line; crossing it means stop and look. The lines live in `policy.py`, and they are **changeable**:
+
+```python
+POLICY = {
+    "import_to_contribution_ceiling": 10,   # imported : contributed
+    "books_without_effect":            3,   # consecutive books with no effect
+    "staging_backlog_limit":          50,   # ungated backlog
+}
+```
+
+`stop.py` judges four things against those lines. It returns **what should be done** — and does none of it:
+
+```python
+import stop
+for finding in stop.judge(conn):
+    print(finding["state"], finding["condition"], finding["action"])
+```
+
+```
+triggered  import_dominates     pause_import
+clear      staging_backlog      None
+not_judged books_have_no_effect None
+not_judged unfaithful_import    None
+```
+
+All four actions (pause imports / drop the book route / pause distillation / roll back a batch) **belong to the application layer**. This layer says what should happen, not what did — so it contains **not a single write statement** (B26 criterion 7 pins this statically).
+
+### Three states, not two
+
+| State | Meaning |
+|---|---|
+| `triggered` | The line was crossed; act |
+| `clear` | Judged, and not crossed |
+| `not_judged` | **Cannot be judged** (missing input / no denominator) — **not** the same as "not crossed" |
+
+Collapsing this to a boolean causes a real failure. The sharpest case is **cold start**: with zero community contributions the "imported : contributed" line has no denominator. Read as a ratio, zero contributions makes any import volume cross it — so cold start kills itself on step one (and step one *is* importing: you distil a book first, then there is something to discuss).
+
+The same "nothing wrong" also comes in two kinds, and they must not be merged:
+
+```python
+stop.judge(conn)                                # → not_judged: nobody has checked yet
+stop.judge(conn, declared={"unfaithful": []})   # → clear: checked, and clean
+```
+
+One requires someone to go look; the other does not. Merge them and **a thing that was never done gets reported as a thing that was done and passed**.
+
+### Two of them need outside input
+
+Only two of the four are computable from this repo alone:
+
+| Condition | What it counts |
+|---|---|
+| Imports dominate contributions | `artifact` rows (`intake='staged'` vs community) |
+| Staging backlog | `staging` rows still `pending` |
+| Consecutive books with no effect | **cross-batch history** — not stored here; the caller supplies it |
+| An imported node "not in the book" | **a human's check against the source** — the caller supplies it |
+
+The last two arrive via `declared`, and what arrives are **observations, not conclusions**: the caller says whether each book had an effect, and *this* layer counts the streak; the caller names the suspect nodes, and *this* layer looks up which batches they belong to.
+
+### How it splits from the observation points
+
+`§八` splits P7 into two columns: **observation points only record** (they may never be compared against a number), **`POLICY` only triggers actions**. `observe()` is the recording half (pure reads, no comparisons at all); `judge()` is the threshold half. Neither touches content structure, and the observed counts never enter `upper.COUNT_SIGNALS` (B26 criterion 5 pins this).
+
 ## On a young corpus it is **dormant**
 
 This is a **falsifiable prediction**, not a disclaimer:
@@ -303,7 +369,7 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 25 falsification checks
+python checks.py                      # the 26 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
 python -m unittest test_pointer       # locators: position only, never the body
 python -m unittest test_staging       # intake gate: no gate, no `active`
@@ -312,7 +378,8 @@ python -m unittest test_rules         # rule set: nothing written / conjunction 
 python -m unittest test_contribute    # seven granularities, each creatable / empty store too
 python -m unittest test_candidates    # a candidate is never counted / only two routes make it count
 python -m unittest test_views         # a view is a cache: idempotent, and it never moves the lower layer
-python -m unittest test_checks        # proves those 25 checks aren't vacuous
+python -m unittest test_stop          # stop conditions judge only / "cannot judge" ≠ "did not trigger"
+python -m unittest test_checks        # proves those 26 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:
@@ -321,7 +388,7 @@ python -m unittest test_checks        # proves those 25 checks aren't vacuous
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 24 条，B1, B10, ... 无命中。
+否证检查全部通过：共 26 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` skips 7 tests** — output is `OK (skipped=7)`. This is **intentional**:

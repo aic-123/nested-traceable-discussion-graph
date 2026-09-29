@@ -33,17 +33,20 @@ import tokenize
 from functools import partial
 from pathlib import Path
 
-# ⚠️ 本文件**只有十一条检查** import 了被检查的模块（B16–B25），其余全是纯静态扫源码。
+# ⚠️ 本文件**只有十三条检查** import 了被检查的模块（B16–B26），其余全是纯静态扫源码。
 # 理由：那几条查的是**词汇表定义的自洽性** —— 那是「规格」，读常量就是读规格，
 # 比用正则去抠源码里的字面量准得多（正则抠字面量改个格式就失效）。
-# 它们不引入运行时依赖：`candidates` / `contribute` / `pointer` / `scaffold` /
-# `staging` / `rules` / `upper` / `views` 都是本地模块，且只用标准库。
+# 它们不引入运行时依赖：`candidates` / `contribute` / `pointer` / `policy` /
+# `scaffold` / `staging` / `stop` / `rules` / `upper` / `views` 都是本地模块，
+# 且只用标准库。
 import candidates
 import contribute
 import pointer
+import policy
 import rules
 import scaffold
 import staging
+import stop
 import upper
 import views
 
@@ -1930,6 +1933,206 @@ def check_the_view_layer_cannot_write_back(
     return hits
 
 
+# --- B26（贯穿项：停止条件）用的常量 -------------------------------------------
+
+# 停止条件层**允许** import 的模块。**白名单，不是黑名单。**
+#
+# ⚠️ 特别地，**不许 import `upper`** —— 那是上层。停止条件是运维门槛，
+# 一旦它能读上层的信号，工程稿 §八 那条分工（观测点只记 / POLICY 只触发动作）
+# 就当场作废。白名单写法的好处：将来新增一个模块，**默认是被挡住的**。
+_STOP_ALLOWED_IMPORTS = ("__future__", "policy", "scaffold", "sqlite3", "staging")
+
+# 阈值**只能**经这个函数取。
+#
+# 直接下标 `policy.POLICY[...]` 就等于把门槛写死在调用点 ——
+# 而「可变动」正是这个模块存在的全部理由（工程稿 §〇 Q6）。
+_STOP_VALUE_FN = "value"
+
+# `judge()` 的函数体里必须真的调它。只写签名不写调用，
+# 「本模块只判不执行」就退化成一句注释。
+_STOP_OBSERVE_FN = "observe"
+
+
+def _stop_imports(path: Path) -> list[str]:
+    """本模块 import 了哪些**顶层**模块。`from __future__ import ...` 也算一个。"""
+    mods: list[str] = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            mods += [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            mods.append(node.module.split(".")[0])
+    return sorted(set(mods))
+
+
+def _stop_returned_keys(path: Path, fn_name: str) -> list[str] | None:
+    """某个函数里 `return {...}` 那个字典的**键**。找不到就返回 `None`。
+
+    ⚠️ 返回 `None` 而不是空列表 —— 同 `_view_columns()` 那条理由：
+    「没找到那个 return」和「return 了一个空字典」是两件事，
+    混起来会让检查在函数被改名之后**静默通过**。
+    """
+    node = _ast_defs(path).get(fn_name)
+    if node is None:
+        return None
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Dict):
+            return [k.value for k in sub.value.keys if isinstance(k, ast.Constant)]
+    return None
+
+
+def check_stop_conditions_cannot_act_on_their_own(
+    *, source_path: Path | None = None,
+    conditions: tuple | None = None, actions: dict | None = None,
+    keys: dict | None = None, observed: tuple | None = None,
+    policy_keys=None, count_signals=None, intake=None,
+    staged: str | None = None, direct: str | None = None,
+    allowed_imports: tuple = _STOP_ALLOWED_IMPORTS,
+) -> list[tuple[str, int, str]]:
+    """停止条件**只判不执行**（贯穿项 · 工程稿 §5.4 四条件）。
+
+    四条件里两个动作听起来都无害 —— 「暂停导入」「暂停蒸馏」。
+    真正的失败方式很安静：**让这个模块自己去做那件事**。
+    那一刻它就从一个只读的判定器变成了一条写路径，而它看起来还是个判定器。
+
+    判据：
+
+    1. ★ `STOP_CONDITIONS` / `STOP_ACTIONS` / `STOP_POLICY_KEYS` **三张表的键集相同**
+       （双向），且动作名**非空、两两不同**。少一处就是「这个条件触发后没人知道该干什么」；
+       两个条件共用一个动作名，事后看不出到底是哪条被触发了。
+    2. ★ `STOP_POLICY_KEYS` 里**非 `None`** 的值都真的在 `policy.POLICY` 里。
+       写错一个名字，`policy.value()` 会在**运行时**抛 `KeyError` ——
+       而那时停止条件已经该报没报了。`None` 只许出现在「无门槛」那条。
+    3. ★ import 白名单：只许 `_STOP_ALLOWED_IMPORTS` 里的。**尤其不许 `upper`** ——
+       读了上层信号，工程稿 §八 那条分工就作废。
+    4. ★ 两个来源口的名字在 `scaffold.INTAKE_CHANNELS` 里。
+       写成别的词**不会报错**，只会永远数出 0 —— 而 0 长得像个正常读数。
+    5. ★ `OBSERVED_KEYS` 与 `upper.COUNT_SIGNALS` **不相交**。
+       观测量混进上层信号白名单 = 让上层读运维门槛（工程稿 §八，撞 B4）。
+    6. ★ `observe()` 返回的字典**恰好**是 `OBSERVED_KEYS`。
+       常量与实现漂开之后，判据 5 守的是一张过期的名单。
+    7. ★ 源码里**一句写语句都没有**（`INSERT INTO` / `UPDATE` / `DELETE FROM`）。
+       这是「只判不执行」的静态落点 —— 本模块从头到尾只该有 `SELECT`。
+    8. ★ 阈值只经 `policy.value()` 取：代码行里**不许出现 `POLICY[`**。
+       直接下标等于把门槛写死在调用点，「可变动」当场失效。
+    9. ★ `judge()` 的**函数体里真的调了** `observe()`。
+       只写签名不写调用的话，「观测与判定分开」就退化成一句注释
+       （手法同 B24 判据 5、B25 判据 5）。
+
+    ⚠️ 静态拦不住什么，说清楚（同 B14 / B18 / B20 / B22 / B23 / B24 / B25 的既有立场）：
+    它拦不住「调用方拿到 `action` 之后自己乱做」—— 那是应用层的事。
+    这条盯的是**停止条件层自己的形状**：它不许长出执行能力。
+    """
+    source_path = source_path or (ROOT / "stop.py")
+    is_real = source_path.name == "stop.py"
+    if is_real and not source_path.is_file():
+        return [("stop.py", 1,
+                 "停止条件层不在 —— 工程稿 §5.4 的四条件没有落点。")]
+
+    conditions = stop.STOP_CONDITIONS if conditions is None else conditions
+    actions = stop.STOP_ACTIONS if actions is None else actions
+    keys = stop.STOP_POLICY_KEYS if keys is None else keys
+    observed = stop.OBSERVED_KEYS if observed is None else observed
+    policy_keys = set(policy.POLICY) if policy_keys is None else set(policy_keys)
+    count_signals = (set(upper.COUNT_SIGNALS) if count_signals is None
+                     else set(count_signals))
+    intake = scaffold.INTAKE_CHANNELS if intake is None else intake
+    staged = stop.STAGED_CHANNEL if staged is None else staged
+    direct = stop.DIRECT_CHANNEL if direct is None else direct
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, n: int = 1) -> None:
+        hits.append((source_path.name, n, msg))
+
+    # 1 三张表键集相同 + 动作名可用
+    want = set(conditions)
+    for label, table in (("STOP_ACTIONS", actions), ("STOP_POLICY_KEYS", keys)):
+        got = set(table)
+        extra, missing = sorted(got - want), sorted(want - got)
+        if extra:
+            flag(f"{label} 里有 {extra}，它们不在 STOP_CONDITIONS 里 —— "
+                 "多出来的那一项永远不会被读到，而它看起来是个正经配置。")
+        if missing:
+            flag(f"{label} 少了 {missing} —— 那个条件触发之后，"
+                 "没人知道该做什么 / 该比哪个门槛。")
+    names = [a for a in actions.values() if isinstance(a, str) and a]
+    if len(names) != len(actions):
+        flag("STOP_ACTIONS 里有空的动作名 —— 触发之后无事可做，"
+             "而这个条件仍然会报「触发」。")
+    if len(set(names)) != len(names):
+        flag(f"STOP_ACTIONS 的动作名有重复：{sorted(names)} —— "
+             "两个条件共用一个名字，事后看不出到底是哪条被触发了。")
+
+    # 2 门槛键真的存在（None 只许出现在无门槛那条）
+    for condition, key in keys.items():
+        if key is None:
+            continue
+        if key not in policy_keys:
+            flag(f"{condition} 读的门槛键 {key!r} 不在 `policy.POLICY` 里 —— "
+                 f"现有：{sorted(policy_keys)}。"
+                 "写错名字的话，`policy.value()` 会在运行时抛 KeyError，"
+                 "而那时这个条件已经该报没报了。")
+
+    # 3 import 白名单
+    for mod in _stop_imports(source_path):
+        if mod not in allowed_imports:
+            flag(f"import 了 {mod!r}，不在白名单 {list(allowed_imports)} 里。"
+                 + ("尤其 `upper` 不许 —— 停止条件是运维门槛，"
+                    "读了上层信号，工程稿 §八 那条分工就作废。"
+                    if mod == "upper" else ""))
+
+    # 4 来源口名字真的在词表里
+    for name in (staged, direct):
+        if name not in intake:
+            flag(f"来源口名字 {name!r} 不在 `scaffold.INTAKE_CHANNELS` "
+                 f"{list(intake)} 里 —— 写成别的词**不会报错**，"
+                 "只会永远数出 0，而 0 长得像个正常读数。")
+
+    # 5 观测量不许进上层信号白名单
+    overlap = sorted(set(observed) & count_signals)
+    if overlap:
+        flag(f"观测量 {overlap} 出现在 `upper.COUNT_SIGNALS` 里 —— "
+             "那是上层的信号白名单，混进去等于让上层读运维门槛"
+             "（工程稿 §八「观测点只记不算」，撞 B4）。")
+
+    # 6 observe() 返回的键恰好是 OBSERVED_KEYS
+    returned = _stop_returned_keys(source_path, _STOP_OBSERVE_FN)
+    if returned is None:
+        flag(f"`{_STOP_OBSERVE_FN}()` 里找不到 `return {{...}}` —— "
+             "判据 5 守的那张名单就没法跟实现对上了。")
+    elif sorted(returned) != sorted(observed):
+        flag(f"`{_STOP_OBSERVE_FN}()` 返回 {sorted(returned)}，"
+             f"而 OBSERVED_KEYS 是 {sorted(observed)} —— 两处漂开之后，"
+             "判据 5 守的是一张过期的名单。")
+
+    # 7 一句写语句都没有
+    for n, line in code_lines(source_path):
+        for target in _VIEW_WRITE.findall(line):
+            flag(f"有写语句，目标是 {target!r} —— 停止条件**只判不执行**，"
+                 "四个动作都是应用层的开关。多一条写路径，"
+                 "这个模块就从判定器变成了能悄悄改库的东西。", n)
+
+    # 8 阈值只经 policy.value() 取
+    for n, line in code_lines(source_path):
+        if "POLICY[" in line:
+            flag("直接下标取了 `POLICY[...]` —— 门槛要经 "
+                 f"`policy.{_STOP_VALUE_FN}()` 取，"
+                 "否则「可变动」当场失效（工程稿 §〇 Q6）。", n)
+
+    # 9 judge() 里真的调了 observe()
+    judge_fn = _ast_defs(source_path).get("judge")
+    if judge_fn is None:
+        flag("judge() 不见了 —— 四条件就没有判定入口了。")
+    else:
+        called = {n.func.id for n in ast.walk(judge_fn)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if _STOP_OBSERVE_FN not in called:
+            flag(f"judge() 的函数体里没有调 {_STOP_OBSERVE_FN}() —— "
+                 "「观测与判定分开」就只在文档里成立。")
+
+    return hits
+
+
 def all_checks():
     """(编号, 说明, 条款, 返回命中的函数) —— **唯一的登记表**。
 
@@ -1978,6 +2181,8 @@ def all_checks():
            "§C2.5 第 3 档 · 2026-09-28", check_candidates_cannot_make_themselves_true)
     yield ("B25", "视图层永不回写写模型（写语句只碰视图表，列名白名单，快照覆盖全表）",
            "§C7.1 ④ · 2026-09-29", check_the_view_layer_cannot_write_back)
+    yield ("B26", "停止条件只判不执行（三张表键集相同，一句写语句都没有，阈值只经 policy.value 取）",
+           "§5.4 停止条件 · 2026-09-29", check_stop_conditions_cannot_act_on_their_own)
 
 
 def main() -> int:

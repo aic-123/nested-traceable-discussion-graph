@@ -278,9 +278,10 @@ class TestEveryCheckFires(unittest.TestCase):
         # 喂 `_tmp_probe_zzz.py` 到不了它。
         # B24 同理（它只扫 `candidates.py`）：在 TestB24Fires。
         # B25 同理（它只扫 `views.py`）：在 TestB25Fires。
+        # B26 同理（它只扫 `stop.py`）：在 TestB26Fires。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
                           "B16", "B17", "B18", "B19", "B20", "B21", "B22",
-                          "B23", "B24", "B25"}
+                          "B23", "B24", "B25", "B26"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -1961,6 +1962,261 @@ class TestB25Fires(unittest.TestCase):
     def test_B25_is_quiet_on_the_real_module(self):
         self.assertEqual(
             checks.check_the_view_layer_cannot_write_back(), [])
+
+
+def _b26_probe(source: str, **kw) -> list:
+    """把 source 写成临时 `.py` 当 **B26 的源码靶**，跑完删掉。
+
+    与 `_b25_probe` 同形、同理由：B26 只扫 `stop.py` 一个文件，
+    `_scan_with_temp_py()` 喂的是 `_tmp_probe_zzz.py`，**到不了它**。
+
+    ⚠️ 探针只用来验**源码形状**那几条（import 白名单 / 写语句 / 阈值怎么取 /
+    `observe()` 返回什么 / `judge()` 调没调 `observe()`）。
+    表那几条读的是 `stop` 的常量，走参数注入 —— 探针文件里写一份假常量不会被读到。
+    """
+    probe = ROOT / "_tmp_probe_zzz.py"
+    _clean_probes()
+    probe.write_text(source, encoding="utf-8")
+    try:
+        return checks.check_stop_conditions_cannot_act_on_their_own(
+            source_path=probe, **kw)
+    finally:
+        _clean_probes()
+
+
+# 一份**形状完整**的探针骨架：`observe()` 返回的键与 `OBSERVED_KEYS` 一致，
+# 且 `judge()` 里真的调了它。这样「只报我要验的那一处」才验得准 ——
+# 缺一处 B26 会另报一笔，把真正要验的那条淹掉。
+_STOP_PROBE = (
+    "def observe(conn):\n"
+    "    return {\"imported\": 0, \"contributed\": 0, \"staging_backlog\": 0}\n"
+    "def judge(conn, *, declared=None, **override):\n"
+    "    seen = observe(conn)\n"
+    "    return []\n"
+)
+
+
+class TestB26Fires(unittest.TestCase):
+    """B26 的判据是**停止条件层的形状**，探针扫不到 —— 注入假源码 / 假常量来验。
+
+    ⚠️ 最要紧的四条：
+
+    * `test_B26_fires_when_the_layer_writes_something` ——
+      「只判不执行」听起来不可能出错，于是没人防它；而失败方式很安静：
+      模块自己把「暂停导入」做了，那一刻它就从判定器变成了一条写路径，
+      **而它看起来还是个判定器**；
+    * `test_B26_fires_when_the_layer_imports_upper` ——
+      停止条件是运维门槛。读了上层信号，工程稿 §八 那条分工
+      （观测点只记 / POLICY 只触发动作）当场作废；
+    * `test_B26_fires_when_the_threshold_is_read_by_subscript` ——
+      直接下标 = 把门槛写死在调用点，「可变动」失效，
+      而那个数看起来仍然像个配置；
+    * `test_B26_does_not_fire_on_the_real_module` —— **反向判据**。
+      真模块上必须一条都不报，否则「检查会响」这件事本身没被验过
+      （手法同 `test_B25_is_quiet_on_the_real_module`）。
+    """
+
+    @staticmethod
+    def _run(source: str = _STOP_PROBE, **overrides) -> list:
+        return _b26_probe(source, **overrides)
+
+    # --- 1 三张表的键集 -----------------------------------------------
+
+    def test_B26_fires_when_a_condition_has_no_action(self):
+        """少一条动作 = 那个条件触发之后没人知道该做什么。"""
+        hits = self._run(actions={
+            "import_dominates": "pause_import",
+            "books_have_no_effect": "drop_book_route",
+            "staging_backlog": "pause_distill",
+        })
+        self.assertTrue(_said(hits, "STOP_ACTIONS 少了"), hits)
+
+    def test_B26_fires_when_two_conditions_share_an_action(self):
+        """共用一个动作名 → 事后看不出到底是哪条被触发了。"""
+        hits = self._run(actions={
+            "import_dominates": "same",
+            "books_have_no_effect": "same",
+            "staging_backlog": "same",
+            "unfaithful_import": "same",
+        })
+        self.assertTrue(_said(hits, "动作名有重复"), hits)
+
+    def test_B26_fires_when_an_action_name_is_empty(self):
+        """空动作名 → 条件会报「触发」，而调用方无事可做。"""
+        hits = self._run(actions={
+            "import_dominates": "",
+            "books_have_no_effect": "drop_book_route",
+            "staging_backlog": "pause_distill",
+            "unfaithful_import": "rollback_batch",
+        })
+        self.assertTrue(_said(hits, "空的动作名"), hits)
+
+    def test_B26_fires_when_the_key_table_has_an_extra_condition(self):
+        """多出来的一项永远不会被读到，而它看起来是个正经配置。"""
+        hits = self._run(keys={
+            "import_dominates": "import_to_contribution_ceiling",
+            "books_have_no_effect": "books_without_effect",
+            "staging_backlog": "staging_backlog_limit",
+            "unfaithful_import": None,
+            "no_such_condition": "books_without_effect",
+        })
+        self.assertTrue(_said(hits, "STOP_POLICY_KEYS 里有"), hits)
+
+    # --- 2 门槛键真的存在 ---------------------------------------------
+
+    def test_B26_fires_when_a_threshold_key_does_not_exist(self):
+        """★ 写错名字的话 `policy.value()` 会在**运行时**抛 KeyError ——
+        而那时这个条件已经该报没报了。"""
+        hits = self._run(keys={
+            "import_dominates": "no_such_key",
+            "books_have_no_effect": "books_without_effect",
+            "staging_backlog": "staging_backlog_limit",
+            "unfaithful_import": None,
+        })
+        self.assertTrue(_said(hits, "不在 `policy.POLICY` 里"), hits)
+
+    # --- 3 import 白名单 ----------------------------------------------
+
+    def test_B26_fires_when_the_layer_imports_upper(self):
+        """★ 读了上层信号，工程稿 §八 那条分工就作废。"""
+        hits = self._run(_STOP_PROBE + "import upper\n")
+        self.assertTrue(_said(hits, "import 了 'upper'"), hits)
+
+    def test_B26_fires_when_an_import_is_outside_the_whitelist(self):
+        hits = self._run(_STOP_PROBE + "import requests\n")
+        self.assertTrue(_said(hits, "不在白名单"), hits)
+
+    def test_B26_does_not_fire_on_the_declared_imports(self):
+        """★ **反向判据**：白名单里那几个必须放行。
+
+        否则「加了白名单」这件事会变成「什么都 import 不了」，
+        而报出来的理由读起来完全合理。
+        """
+        src = _STOP_PROBE + "import policy\nimport scaffold\nimport staging\n"
+        self.assertEqual(_said(self._run(src), "不在白名单"), [])
+
+    # --- 4 来源口名字 -------------------------------------------------
+
+    def test_B26_fires_when_a_channel_name_is_not_in_the_vocabulary(self):
+        """★ 写成别的词**不会报错**，只会永远数出 0 —— 而 0 像个正常读数。"""
+        hits = self._run(staged="staged_typo")
+        self.assertTrue(_said(hits, "不在 `scaffold.INTAKE_CHANNELS`"), hits)
+
+    # --- 5 观测量不许进上层信号白名单 ---------------------------------
+
+    def test_B26_fires_when_an_observed_key_is_in_count_signals(self):
+        """观测点混进上层信号白名单 = 让上层读运维门槛（撞 B4）。"""
+        hits = self._run(observed=("challenge_counts",))
+        self.assertTrue(_said(hits, "出现在 `upper.COUNT_SIGNALS` 里"), hits)
+
+    # --- 6 observe() 返回的键 -----------------------------------------
+
+    def test_B26_fires_when_observe_returns_something_else(self):
+        src = (
+            "def observe(conn):\n"
+            "    return {\"imported\": 0, \"contributed\": 0}\n"
+            "def judge(conn, *, declared=None, **override):\n"
+            "    observe(conn)\n"
+            "    return []\n"
+        )
+        self.assertTrue(_said(self._run(src), "而 OBSERVED_KEYS 是"))
+
+    def test_B26_fires_when_observe_has_no_return_dict(self):
+        """★ 「没找到那个 return」和「return 了一个空字典」是两件事 ——
+        混起来会让检查在函数被改名之后**静默通过**。"""
+        src = (
+            "def observe(conn):\n"
+            "    return 0\n"
+            "def judge(conn, *, declared=None, **override):\n"
+            "    observe(conn)\n"
+            "    return []\n"
+        )
+        self.assertTrue(_said(self._run(src), "找不到 `return {"))
+
+    def test_the_return_parser_reads_keys_not_values(self):
+        """★ **反向判据**：解析器读的是**键**，不是值。
+
+        要是它把值也当键读（或者干脆数了一遍字符串），
+        `observe()` 返回什么都无所谓 —— 判据 6 就成了摆设。
+        """
+        src = (
+            "def observe(conn):\n"
+            "    return {\"imported\": \"x\", \"contributed\": [1],"
+            " \"staging_backlog\": None}\n"
+            "def judge(conn, *, declared=None, **override):\n"
+            "    observe(conn)\n"
+            "    return []\n"
+        )
+        self.assertEqual(_said(self._run(src), "而 OBSERVED_KEYS 是"), [])
+
+    # --- 7 一句写语句都没有 -------------------------------------------
+
+    def test_B26_fires_when_the_layer_inserts(self):
+        """★ 这是本阶段存在的**理由**：停止条件只判不执行。"""
+        src = _STOP_PROBE + (
+            "def touch(conn):\n"
+            "    conn.execute(\"INSERT INTO artifact (id) VALUES ('x')\")\n"
+        )
+        self.assertTrue(_said(self._run(src), "有写语句"), self._run(src))
+
+    def test_B26_fires_when_the_layer_updates(self):
+        src = _STOP_PROBE + (
+            "def touch(conn):\n"
+            "    conn.execute(\"UPDATE staging SET gate_state = 'passed'\")\n"
+        )
+        self.assertTrue(_said(self._run(src), "有写语句"))
+
+    def test_B26_fires_when_the_layer_deletes(self):
+        src = _STOP_PROBE + (
+            "def touch(conn):\n"
+            "    conn.execute(\"DELETE FROM artifact\")\n"
+        )
+        self.assertTrue(_said(self._run(src), "有写语句"))
+
+    # --- 8 阈值只经 policy.value() 取 ---------------------------------
+
+    def test_B26_fires_when_the_threshold_is_read_by_subscript(self):
+        """★ 直接下标 = 门槛写死在调用点，「可变动」当场失效。"""
+        src = _STOP_PROBE + "LIMIT = policy.POLICY[\"staging_backlog_limit\"]\n"
+        self.assertTrue(_said(self._run(src), "直接下标取了"))
+
+    # --- 9 judge() 里真的调了 observe() -------------------------------
+
+    def test_B26_fires_when_judge_does_not_observe(self):
+        """只写签名不写调用的话，「观测与判定分开」就只在文档里成立。"""
+        src = (
+            "def observe(conn):\n"
+            "    return {\"imported\": 0, \"contributed\": 0,"
+            " \"staging_backlog\": 0}\n"
+            "def judge(conn, *, declared=None, **override):\n"
+            "    return []\n"
+        )
+        self.assertTrue(_said(self._run(src), "没有调 observe()"))
+
+    def test_B26_fires_when_judge_is_gone(self):
+        src = (
+            "def observe(conn):\n"
+            "    return {\"imported\": 0, \"contributed\": 0,"
+            " \"staging_backlog\": 0}\n"
+        )
+        self.assertTrue(_said(self._run(src), "judge() 不见了"))
+
+    def test_B26_fires_when_the_module_is_missing(self):
+        hits = checks.check_stop_conditions_cannot_act_on_their_own(
+            source_path=ROOT / "不存在的目录" / "stop.py")
+        self.assertTrue(_said(hits, "停止条件层不在"), hits)
+
+    # --- 反向判据 ------------------------------------------------------
+
+    def test_B26_does_not_fire_on_a_clean_probe(self):
+        """骨架本身必须是干净的 —— 否则上面每一条的「命中」
+        都可能来自骨架而不是我注入的那一处。"""
+        self.assertEqual(self._run(), [])
+
+    def test_B26_does_not_fire_on_the_real_module(self):
+        """★ **反向判据**：真模块上一条都不报。"""
+        self.assertEqual(
+            checks.check_stop_conditions_cannot_act_on_their_own(), [])
 
 
 class TestNoResidue(unittest.TestCase):
