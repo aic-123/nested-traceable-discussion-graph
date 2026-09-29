@@ -104,15 +104,57 @@ class Upgrade(NamedTuple):
     sql: str
 
 
-UPGRADES: tuple[Upgrade, ...] = ()
+UPGRADES: tuple[Upgrade, ...] = (
+    Upgrade(
+        version=2,
+        name="relation 加 asserted_by —— 谁主张这条边",
+        sql="""
+-- 给边补一栏 asserted_by：**谁主张这条边**（PROV-O wasAttributedTo）。
+--
+-- 为什么加：节点那边 asserted_by（谁主张的）与 origin（谁产的）是分开的两栏，
+-- 边这边只有 origin。于是「这条算数的边是谁认领的」只能去 event 表 join
+-- candidate_promoted 才查得到 —— 而那是**历史事件**，不是边自己的属性。
+--
+-- 为什么可空：SQLite 的 ALTER TABLE ADD COLUMN 加 NOT NULL 列**必须带
+-- DEFAULT**，而给 DEFAULT 就等于给「没人主张」留了个位置 —— 那正是这一栏
+-- 要挡的。所以列上不设约束，「算数的边必须有主张者」由 add_relation 判。
+-- 同 artifact.asserted_by 的做法（那一栏也是可空的）。
+--
+-- 列只能加在末尾：ALTER TABLE ADD COLUMN 没有位置参数，新列一定排在
+-- created_at 之后，与 artifact 表里 asserted_by 排在中间不同。按列名取值
+-- 不受影响，所以不为了对齐顺序去重建表（那要动 B27 的 DROP TABLE 禁令）。
+--
+-- 存量行留 NULL：它们确实没有这一栏的信息，回填就得编一个值。
+ALTER TABLE relation ADD COLUMN asserted_by TEXT;
+""",
+    ),
+)
 """有序迁移清单 —— **只许追加，不许改已发布的那几条**。
 
 改已发布的迁移等于：同一个版本号在两台机器上做不同的事，
 而 `user_version` 已经抬过去了，谁也看不出来。
 
-⚠️ 现在**是空的**，这不是没写完 —— 是「基线之后还没有一条需要走的迁移」。
-被迁移机制挡住的那条（H10 给 `relation` 加 `asserted_by`）是**需求方的决定**，
-不是本模块的。机制先立起来，第一条真迁移由那个决定带出来。
+⚠️ 第一条迁移（v2）加 `relation.asserted_by`，它原先被「本仓没有迁移机制」
+挡住（工程稿 §11.5 的路 ①）。机制补上之后那条路通了 —— 但**基线 `SCHEMA`
+一个字没改**，新栏只由这条迁移加。理由见 `scaffold.init()`：`SCHEMA` 建的是
+**v1 形状**，若在 `SCHEMA` 里也加这一栏，新库会被迁移**再加一次**，
+`ALTER TABLE` 报 duplicate column。
+
+--- v2 参考了哪些成熟做法（**参考，不是照搬**）---------------------------------
+
+「给已有的表加一栏」不是本仓发明的问题，业界有成熟解法。取用的是它们的
+**判断**，不是它们的**步骤** —— 每一步都得在本仓的约束下重新过一遍：
+
+| 成熟做法 | 它怎么说 | 本仓取什么 / 不取什么 |
+|---|---|---|
+| **expand-contract**（PlanetScale 等迁移手册的通用模式） | schema 变更拆成「先加（向后兼容）→ 迁数据 → 后删」 | **取前半**：加**可空**列，不动存量行。**不取后半**：不回填、不加 `NOT NULL` —— 存量行确实没有这个信息，回填就得**编一个值** |
+| **SQLite 官方 `ALTER TABLE`** | 加 `NOT NULL` 列**必须**带一个非 NULL 的 `DEFAULT` | **取它的结论**：正因为「必须带 `DEFAULT`」，这里才**不加 `NOT NULL`** —— 那个 `DEFAULT` 就是「没人主张」的位置，而它正是这一栏要挡的东西 |
+| **SQLite 官方 12 步改表流程** | 改列顺序 / 加删约束要「建新表 → 复制数据 → 删旧表 → 重命名新表」 | **不取**：它要 `DROP TABLE`，撞 B27（P6 可逆性：supersede 而非 delete）。所以新列只能排在末尾，不为了对齐顺序去重建表 |
+| **RDF reification / RDF-star** | 「边上的属性」的经典答案：把边写成 statement，再给它挂属性 | **取它的诊断**（「边也能有自己的属性」），**不取它的形态**：那是 RDF 三元组的绕法；本仓是 property graph，边上直接加一栏就是它要的效果 |
+
+⚠️ 一句话：成熟做法给的是「**这样加列是安全的**」这个判断，
+不是可以直接抄的脚本 —— 它们的默认前提（存量可回填、可以删表重建）
+在本仓**两条都不成立**。
 """
 
 

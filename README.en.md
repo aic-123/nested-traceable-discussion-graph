@@ -27,9 +27,9 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
 | `stop.py` | **Stop conditions** — judges four things against `policy`'s lines. **Judges only, never acts**: not a single write statement, and all four actions belong to the application layer |
 | `upgrade.py` | **schema upgrades** — forward only, never downgrades. An upgrade applies fully or not at all |
-| `checks.py` | **27 falsification checks. Each one is executable**, not an adjective in a doc |
+| `checks.py` | **28 falsification checks. Each one is executable**, not an adjective in a doc |
 | `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` / `test_upgrade.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
-| `test_checks.py` | Proves those 27 checks **aren't vacuous** |
+| `test_checks.py` | Proves those 28 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -429,10 +429,39 @@ So statements run one at a time via `execute()`, and the whole upgrade
 | No `DROP TABLE` / `DELETE FROM` in the checklist | P6 reversibility: supersede, never delete |
 | An import allow-list (no `scaffold`) | Upgrades work on the **old** shape, while `scaffold`'s functions assume the new one |
 
-The checklist is currently **empty** — after the baseline there is not yet an upgrade
-to run. That is not "unfinished": the one thing the mechanism was blocking
-(adding `asserted_by` to `relation`) is a **decision for the requirements owner**,
-not for this layer.
+The checklist now has **one** entry: v2 adds `asserted_by` to `relation`
+(**who asserts this edge**). It is the first real upgrade after the baseline —
+the first instance of "the path that was blocked is now open".
+
+⚠️ **Mature practice is a reference, not a template.** What is taken is their
+*judgement*, not their *steps* — every step has to be re-checked against this
+repo's constraints:
+
+| Mature practice | What it says | What this repo takes / leaves |
+|---|---|---|
+| **expand-contract** | "add (backward-compatible) → backfill → drop" | **Takes the first half**: add a **nullable** column, leave existing rows alone. **Leaves the second half**: no backfill, no `NOT NULL` — existing rows genuinely lack this information, so a backfill would have to **invent a value** |
+| **SQLite's `ALTER TABLE`** | Adding a `NOT NULL` column **requires** a non-NULL `DEFAULT` | **Takes its conclusion**: precisely because a `DEFAULT` is required, this column does **not** get `NOT NULL` — that `DEFAULT` would be a slot for "nobody asserts it", which is exactly what the column exists to prevent |
+| **RDF reification / RDF-star** | The classic answer to "attributes on an edge": write the edge as a statement, then attach attributes to it | **Takes its diagnosis** ("an edge can have its own attributes"), **leaves its shape**: that is RDF's triple workaround; this repo is a property graph, so one column on the edge is exactly the effect |
+
+Their default assumptions (existing rows can be backfilled, tables can be dropped
+and rebuilt) **both fail here** — the per-item trade-offs are written up in
+`upgrade.py`.
+
+### What B28 guards
+
+Adding a column is only half the job — its **invariant** needs a check too,
+otherwise the column is just a column:
+
+| Criterion | What it stops |
+|---|---|
+| The baseline `SCHEMA` does **not** have this column | Adding it in both places makes a fresh library apply the migration **twice** → `duplicate column` (**only shows up on fresh libraries** — old ones migrate fine) |
+| **Exactly one** migration adds it | 0 = the column does not exist in existing libraries while the code assumes it does; 2 = the same thing done twice |
+| The guard skeleton in `add_relation` is still there | Delete it and everything still runs, every test still passes — but libraries start collecting edges that **count yet nobody claims** |
+| `promote`'s UPDATE writes `state` **and** `asserted_by` together | Split into two statements and "counts but unclaimed" becomes a state that **can exist** |
+
+The static half only checks that those pieces are still present — it does **not**
+parse whether the two lines are correct. That half lives in the behavioural tests
+(`test_candidates`' `promote` claim, `test_upgrade`'s no-data-loss).
 
 ## On a young corpus it is **dormant**
 
@@ -452,7 +481,7 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 27 falsification checks
+python checks.py                      # the 28 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
 python -m unittest test_pointer       # locators: position only, never the body
 python -m unittest test_staging       # intake gate: no gate, no `active`
@@ -463,7 +492,7 @@ python -m unittest test_candidates    # a candidate is never counted / only two 
 python -m unittest test_views         # a view is a cache: idempotent, and it never moves the lower layer
 python -m unittest test_stop          # stop conditions judge only / "cannot judge" ≠ "did not trigger"
 python -m unittest test_upgrade       # forward only / no downgrade / a failed upgrade leaves nothing behind
-python -m unittest test_checks        # proves those 27 checks aren't vacuous
+python -m unittest test_checks        # proves those 28 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:
@@ -472,7 +501,7 @@ python -m unittest test_checks        # proves those 27 checks aren't vacuous
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 27 条，B1, B10, ... 无命中。
+否证检查全部通过：共 28 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` skips 7 tests** — output is `OK (skipped=7)`. This is **intentional**:

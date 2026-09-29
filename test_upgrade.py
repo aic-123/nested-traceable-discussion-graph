@@ -41,11 +41,15 @@ import scaffold
 import views
 
 
-# 注入用的假清单。**刻意不是 `upgrade.UPGRADES`** —— 真清单现在是空的
-# （基线之后还没有一条需要走的迁移），拿它测等于什么都没测。
+# 注入用的假清单。**刻意不是 `upgrade.UPGRADES`** —— 拿真清单测等于把
+# 「机制对不对」和「真清单对不对」搅在一起，而且真清单每加一条迁移，
+# 这个文件就有一批用例失败在「起点不是它以为的那个」。
+#
+# 版本号从 `BASELINE_VERSION + 1` 起、连续 —— 与真清单的编号无关
+# （底座是基线库，见 `_Base`）。
 #
 # 用 `ALTER TABLE ... ADD COLUMN` 是因为它**只加不删**，
-# 正好是 P6 可逆性允许的那一类，也正好是 H10 被否掉的那条要做的事。
+# 正好是 P6 可逆性允许的那一类，形状也同 v2 那条真迁移。
 _FAKE = (
     upgrade.Upgrade(2, "加一栏 probe2",
                       "ALTER TABLE artifact ADD COLUMN probe2 TEXT;"),
@@ -65,8 +69,19 @@ def _row_counts(conn) -> dict:
 class _Base(unittest.TestCase):
 
     def setUp(self):
+        # ⚠️ 刻意**不用 `scaffold.init()`**。
+        #
+        # `init()` 会跑**真清单**（`upgrade.UPGRADES`），于是库的版本号取决于
+        # 真清单现在有多长 —— 而这个文件验的是**机制**，用的是注入的假清单
+        # （版本号从 `BASELINE_VERSION + 1` 起）。两者一耦合，
+        # 真清单每加一条迁移，就有一批用例失败在「起点不是它以为的那个」。
+        #
+        # 所以底座是**基线形状 + 版本号 1** 这个干净的起点：
+        # 只建 `SCHEMA`（v1 形状），再用空清单把版本标到基线。
         self.conn = scaffold.connect()
-        scaffold.init(self.conn)
+        self.conn.executescript(scaffold.SCHEMA)
+        self.conn.commit()
+        upgrade.to_latest(self.conn, upgrades=())
 
     def tearDown(self):
         self.conn.close()
@@ -95,8 +110,18 @@ class TestTheBaselineGetsStamped(_Base):
     """0 → 1 是**标记**，不是迁移。老库和新库走同一条路。"""
 
     def test_a_fresh_library_is_stamped_by_init(self):
-        """`init()` 之后版本必须已经是最新 —— 这是 B27 判据 5 的运行时对面。"""
-        self.assertEqual(upgrade.current_version(self.conn), upgrade.LATEST_VERSION)
+        """`init()` 之后版本必须已经是最新 —— 这是 B27 判据 5 的运行时对面。
+
+        ⚠️ 这里**自己建一个库**，不用 `self.conn` —— 底座是基线库（见 `_Base`），
+        而这条验的正是 `init()` 会不会把版本推到最新。两者不是同一件事。
+        """
+        fresh = scaffold.connect()
+        try:
+            scaffold.init(fresh)
+            self.assertEqual(upgrade.current_version(fresh),
+                             upgrade.LATEST_VERSION)
+        finally:
+            fresh.close()
 
     def test_a_pre_migration_library_reads_as_zero(self):
         """迁移机制引入之前建的库：只有表，没有版本号。"""
@@ -105,7 +130,9 @@ class TestTheBaselineGetsStamped(_Base):
         old.commit()
         try:
             self.assertEqual(upgrade.current_version(old), 0)
-            upgrade.to_latest(old)
+            # 空清单 —— 这条验的是「0 → 基线是**标记**」，
+            # 不是「真清单能跑」（那是 test_the_old_library_keeps_its_tables）。
+            upgrade.to_latest(old, upgrades=())
             self.assertEqual(upgrade.current_version(old), upgrade.BASELINE_VERSION)
         finally:
             old.close()
@@ -135,11 +162,13 @@ class TestItIsIdempotent(_Base):
     """跑第二遍什么都不做 —— 幂等不是「结果一样」，是**压根不写**。"""
 
     def test_the_second_run_reports_nothing_done(self):
-        self.assertEqual(upgrade.to_latest(self.conn), ())
+        upgrade.to_latest(self.conn, upgrades=_FAKE)      # 第一遍：跑 v2 v3
+        self.assertEqual(upgrade.to_latest(self.conn, upgrades=_FAKE), ())
 
     def test_the_second_run_does_not_touch_the_library(self):
+        upgrade.to_latest(self.conn, upgrades=_FAKE)
         before = views.snapshot(self.conn)
-        upgrade.to_latest(self.conn)
+        upgrade.to_latest(self.conn, upgrades=_FAKE)
         self.assertEqual(views.snapshot(self.conn), before)
 
     def test_a_fully_upgraded_library_has_nothing_pending(self):

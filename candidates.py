@@ -58,8 +58,13 @@ B24 把「`CANDIDATE_STATE` 真的在 `RELATION_STATES` 里」钉成判据：
 
 --- `origin` 为什么必填、且没有默认值 ------------------------------------------
 
-`relation` 表没有 `asserted_by` 栏（那一栏在 `artifact` 上）。所以一条候选边
-「**是谁提的**」只能记在 `origin` 里。既然它是唯一的载体，就**不许有默认值** ——
+`relation` 表上确实有一栏 `asserted_by`（谁主张这条边，PROV-O
+`wasAttributedTo`），但它答的**不是**这个问题。候选边由 AI 提
+（`origin="ai:…"`），而**没人主张** —— 所以候选边的 `asserted_by`
+必须是 `NULL`，那一栏要等它**算数**那一刻由提拔它的人写（见 `promote()`）。
+
+「**是谁提的**」只能记在 `origin` 里（PROV-O `wasGeneratedBy`）。
+既然它是这个问题的唯一载体，就**不许有默认值** ——
 留一个默认值等于给「没人提过这条边」留了个位置，而它看起来很正常。
 
 --- 而且它还必须带一个**封闭前缀**（2026-09-29 补）----------------------------
@@ -70,17 +75,25 @@ B24 把「`CANDIDATE_STATE` 真的在 `RELATION_STATES` 里」钉成判据：
 
 所以 `origin` 必须带 `ORIGIN_PREFIXES` 里的一个前缀，判不出就抛。
 
-⚠️ 为什么不给 `relation` 补一栏 `asserted_by`（工程稿 §11.5 的另一条路）：
-当时**本仓没有迁移机制** —— 没有 `schema_version`、没有 `ALTER TABLE`、
-没有版本号。`relation` 是 `CREATE TABLE IF NOT EXISTS` 建的，
-所以往 DDL 里加一列，对**已有的库静默失效**：代码以为那栏在，库里没有。
-而历史数据回填不了，只能留 `NULL` —— 于是「必填」**再落空一次**。
+⚠️ 关于「给 `relation` 补一栏 `asserted_by`」（工程稿 §11.5）：
 
-⚠️ **2026-09-29 更正**：迁移机制已经补上了（`upgrade.py` + B27）。
-上面那条理由**不再是「做不到」**，而是回到它本来的性质 ——
-「用入口词表补，不加列」是**需求方的决定**（工程稿 §11.5），
-不是被基础设施挡住的。机制补上之后，「加一栏」从**走不通**变成
-**有路，但要走一条留痕的路**；要不要走，由那个决定说了算。
+2026-09-29 之前**本仓没有迁移机制** —— 没有 `schema_version`、没有
+`ALTER TABLE`、没有版本号。`relation` 是 `CREATE TABLE IF NOT EXISTS` 建的，
+所以往 DDL 里加一列，对**已有的库静默失效**：代码以为那栏在，库里没有。
+
+**2026-09-29 之后机制补上了**（`upgrade.py` + B27），「加一栏」从
+**走不通**变成**有路，但要走一条留痕的路**。需求方批准走这条路 ——
+`upgrade.UPGRADES` 的 v2 就是它。
+
+**两条路不冲突，各管一件事**（这也是它们能同时存在的原因）：
+
+| 栏 | 答什么 | 谁写 | 候选边该是什么 |
+|---|---|---|---|
+| `origin` | 这条边**谁产的** | 入口词表判（本模块 `record()`） | 必填，带前缀 |
+| `asserted_by` | 这条边**谁主张的** | 算数那一刻（`promote()`） | **必须是 `NULL`** |
+
+「谁提的」与「谁主张的」在候选边上是**两个不同的答案** —— 前者有、后者没有。
+把它们并成一栏，就会得到一个「AI 提的边也有人主张」的库，而那是假的。
 
 ⚠️ 为什么不做成「文档里写一句约定」：约定不是词表。`record()` 是候选边
 **唯一的入口**，在入口上判一次，复用的就是本模块已经用过的两种手法
@@ -183,8 +196,9 @@ def origin_class(origin: str) -> str:
 
     raise CandidateError(
         f"origin 是 {origin!r} —— 它没带声明过的前缀 {list(ORIGIN_PREFIXES)}。"
-        "`relation` 表没有 `asserted_by` 栏，所以一条候选边「是人提的"
-        "还是机器提的」只能记在 `origin` 里；不判前缀的话，写 `gpt` 和写 "
+        "一条候选边「是人提的还是机器提的」记在 `origin` 里"
+        "（`asserted_by` 答的是另一个问题：谁**主张**这条边 —— "
+        "而候选边没人主张）；不判前缀的话，写 `gpt` 和写 "
         "`alice` 在库里长得一样 —— 而 5b 的全部意义就是"
         "「**机器提议、人来提拔**」，分不出这两者这条链就断了。"
     )
@@ -263,7 +277,8 @@ def proposed(conn: sqlite3.Connection) -> list[dict]:
     """还没被确认的候选边。**只读。**
 
     每行多带一个 `origin_class`（`"human"` / `"ai"` / `"import"`）——
-    它是**算出来的**，不是库里的一栏（`relation` 没有 `asserted_by`）。
+    它是**算出来的**，不是库里的一栏。`relation` 上确实有 `asserted_by`，
+    但它答的是「谁主张的」，与「谁提的」不是一回事。
     词表之前写下的老行会是 `None`，意思是「**分不出来**」，不是「没有」。
     """
     rows = conn.execute(
@@ -300,6 +315,15 @@ def promote(conn: sqlite3.Connection, *, relation_id: int,
     ⚠️ 走规则通路必须给 `signals`，且**这条边的某一端**必须满足那条规则。
     两端都不满足 → **拒绝，不兜住**（兜住之后这条边和正常提拔的一模一样）。
     满足的那几端记在返回值的 `justified_by` 里 —— `§C2.5` 第 3 档要的「可解释」。
+
+    ⚠️ 这次提拔**同时写两栏**：`state` 从 `proposed` 变成 `active`，
+    `asserted_by` 从 `NULL` 变成**认领者**（走 `by` 是人名，走 `rule` 是
+    `rule:<规则名>`）。分成两句写的话，「算数了但没人认领」会成为一个
+    **能存在**的状态 —— 而 `scaffold.add_relation` 的守卫拦的正是它
+    （`active` 必须有主张者）。两者是同一个不变式的两面。
+
+    写进 `asserted_by` 之后，「这条算数的边是谁认领的」**不用再 join
+    `event` 表**才查得到 —— 那是历史事件，不是边自己的属性。
     """
     given = [name for name, value in (("by", by), ("rule", rule))
              if value is not None]
@@ -353,8 +377,15 @@ def promote(conn: sqlite3.Connection, *, relation_id: int,
             )
         actor, route = f"{RULE_ACTOR_PREFIX}{rule}", PROMOTE_ROUTE_NAMES["rule"]
 
-    conn.execute("UPDATE relation SET state = 'active' WHERE id = ?",
-                 (relation_id,))
+    # ⚠️ 这一句同时做两件事，缺一不可：
+    #     state        候选 → 算数
+    #     asserted_by  空   → 认领者（谁主张这条边）
+    # 分成两句写的话，「算数了但没人认领」会成为一个**能存在**的状态 ——
+    # 而 `add_relation` 的守卫拦的正是它（active 必须有主张者）。
+    conn.execute(
+        "UPDATE relation SET state = 'active', asserted_by = ? WHERE id = ?",
+        (actor, relation_id),
+    )
     scaffold.record_event(conn, "candidate_promoted", actor, row["from_id"], {
         "relation": relation_id, "kind": row["kind"], "to": row["to_id"],
         "route": route, "rule": rule, "justified_by": justified,
@@ -368,6 +399,7 @@ def promote(conn: sqlite3.Connection, *, relation_id: int,
         "route": route,
         "by": by,
         "rule": rule,
+        "asserted_by": actor,
         "justified_by": justified,
         "proposed_by": row["origin"],
     }

@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from pathlib import Path
 
@@ -53,9 +54,28 @@ def _clean_probes() -> None:
 
     `missing_ok=True`：收尾不该因为「文件已经不在」而抛 —— 那会把**真正的**
     异常盖掉，报出来变成一个看不懂的 `FileNotFoundError`。
+
+    ⚠️ **2026-09-29 补：Windows 上 `unlink` 会偶发 `PermissionError`
+    （WinError 32「另一个程序正在使用此文件」）。** 探针刚 `write_text` 完，
+    杀毒 / 索引服务可能还握着句柄；也可能上一轮的句柄刚被 GC 掉、还没真正释放。
+    实测：同一份代码连跑 5 次，有 1~2 次栽在它上面 ——
+    **而报出来的位置与被测代码无关**（报的是 B26 / B14 之类，真正的原因是
+    上一次 `_clean_probes()` 没删干净，于是探针残留、连锁污染后面十几条用例）。
+
+    所以这里**重试几次**，手法同标准库 `tempfile` 在 Windows 上的做法。
+    重试**不掩盖真残留**：几次之后还在，`TestNoResidue` 照样报出来 ——
+    那是「上一轮进程被硬终止」那一类，本来就该报。
     """
-    for p in ROOT.rglob("_tmp_probe*"):
-        p.unlink(missing_ok=True)
+    for _ in range(10):
+        left = list(ROOT.rglob("_tmp_probe*"))
+        if not left:
+            return
+        for p in left:
+            try:
+                p.unlink(missing_ok=True)
+            except PermissionError:
+                pass          # 句柄还没放手 —— 下一轮再试
+        time.sleep(0.05)
 
 
 # --- 上游产品的专属文件：本仓库没有，跳过要**说出来** -----------------------
@@ -280,9 +300,11 @@ class TestEveryCheckFires(unittest.TestCase):
         # B25 同理（它只扫 `views.py`）：在 TestB25Fires。
         # B26 同理（它只扫 `stop.py`）：在 TestB26Fires。
         # B27 同理（它只扫 `upgrade.py`）：在 TestB27Fires。
+        # B28 同理（它扫 `scaffold.py` / `candidates.py` / `upgrade.py` 三个固定文件）：
+        # 在 TestB28Fires —— 喂 `_tmp_probe_zzz.py` 到不了它。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
                           "B16", "B17", "B18", "B19", "B20", "B21", "B22",
-                          "B23", "B24", "B25", "B26", "B27"}
+                          "B23", "B24", "B25", "B26", "B27", "B28"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -2452,6 +2474,139 @@ class TestB27Fires(unittest.TestCase):
     def test_B27_does_not_fire_on_the_real_module(self):
         """真模块上必须一条都不报。"""
         self.assertEqual(checks.check_upgrades_are_forward_only_and_safe(), [])
+
+
+# --- B28：`relation.asserted_by` 那条不变式 ------------------------------------
+
+# 两个**最小干净样本** —— 判据 3 / 4 的反向靶：那几样都在时不许报。
+#
+# 它们刻意写得比真模块短得多：这条判据只看「那几样在不在」，
+# 样本越短，「报出来的就是我要验的那一处」越准。
+_GOOD_ADD_RELATION = (
+    "def add_relation(conn, *, state, origin, asserted_by=None):\n"
+    "    who = (asserted_by or '').strip()\n"
+    "    if state == \"active\":\n"
+    "        who = who or origin\n"
+    "    elif who:\n"
+    "        raise ScaffoldError('还没算数的边不许有主张者')\n"
+    "    return who\n"
+)
+
+_GOOD_PROMOTE = (
+    "def promote(conn, *, relation_id):\n"
+    "    conn.execute(\n"
+    "        \"UPDATE relation SET state = 'active', asserted_by = ?\"\n"
+    "        \" WHERE id = ?\", (relation_id, relation_id))\n"
+)
+
+
+class TestB28Fires(unittest.TestCase):
+    """B28 守住 `relation.asserted_by` 那条不变式：**算数的边必须有主张者**。
+
+    这条判据扫的是**三个固定文件**（`scaffold.py` / `candidates.py` /
+    `upgrade.py`），喂 `_tmp_probe_zzz.py` 到不了它 —— 所以四条判据
+    各自走参数注入 / 临时文件来验伪，并且**单独钉住**。
+
+    ⚠️ 最要紧的四条：
+
+    * `test_B28_fires_when_the_baseline_schema_also_has_the_column` ——
+      在基线 `SCHEMA` 里也加一栏，新库会被迁移**再加一次**，
+      `ALTER TABLE` 报 duplicate column。这是加列时最容易踩的坑，
+      而且**只在新库上出现**（老库走迁移，反而正常）；
+    * `test_B28_fires_when_no_migration_adds_the_column` ——
+      没有迁移 = 已有库上那栏不存在，而代码以为它在；
+    * `test_B28_fires_when_the_guard_is_gone` —— 守卫被删，
+      一切照跑、所有用例照过，只是库里开始出现「算数但没人认领」的边；
+    * `test_B28_does_not_fire_on_the_real_modules` —— **反向判据**。
+      真模块上必须一条都不报，否则「检查会响」这件事本身没被验过
+      （手法同 `test_B27_does_not_fire_on_the_real_module`）。
+    """
+
+    # --- 判据 1：基线 SCHEMA 里没有这一栏 -------------------------------
+
+    def test_B28_fires_when_the_baseline_schema_also_has_the_column(self):
+        """★ 两处都加 → 新库被迁移再加一次 → duplicate column。"""
+        hits = checks.check_active_relations_are_claimed(
+            schema=("CREATE TABLE IF NOT EXISTS relation (\n"
+                    "    id INTEGER PRIMARY KEY,\n"
+                    "    asserted_by TEXT\n"
+                    ");\n"))
+        self.assertTrue(_said(hits, "duplicate column"), hits)
+
+    def test_B28_fires_when_the_relation_table_is_gone_from_the_schema(self):
+        """找不到 `relation` 建表段 = 这条判据的前提没了，它现在**空转**。"""
+        hits = checks.check_active_relations_are_claimed(
+            schema="CREATE TABLE IF NOT EXISTS artifact (id TEXT);\n")
+        self.assertTrue(_said(hits, "空转"), hits)
+
+    # --- 判据 2：恰好一条迁移加它 ---------------------------------------
+
+    def test_B28_fires_when_no_migration_adds_the_column(self):
+        """★ 0 条：已有库上那栏不存在，而代码以为它在。"""
+        hits = checks.check_active_relations_are_claimed(upgrades=())
+        self.assertTrue(_said(hits, "0 条"), hits)
+
+    def test_B28_fires_when_two_migrations_add_the_column(self):
+        """★ 2 条：同一件事做两遍。"""
+        m = checks.upgrade.Upgrade
+        sql = "ALTER TABLE relation ADD COLUMN asserted_by TEXT;"
+        hits = checks.check_active_relations_are_claimed(
+            upgrades=(m(2, "加一栏", sql), m(3, "再加一次", sql)))
+        self.assertTrue(_said(hits, "2 条"), hits)
+
+    # --- 判据 3 / 4：源码形状（走临时文件）-------------------------------
+
+    def _with_sources(self, scaffold_src: str, candidates_src: str) -> list:
+        """把两份源码写进临时目录，当 B28 的源码靶。
+
+        为什么不用 `_tmp_probe_zzz.py`：这条判据要的是**两个**文件
+        （`scaffold.py` 与 `candidates.py`），一个探针名装不下。
+        `TemporaryDirectory` 也不会在仓库根留下残留（`TestNoResidue` 盯着）。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            here = Path(d)
+            s, c = here / "scaffold.py", here / "candidates.py"
+            s.write_text(scaffold_src, encoding="utf-8")
+            c.write_text(candidates_src, encoding="utf-8")
+            return checks.check_active_relations_are_claimed(
+                scaffold_path=s, candidates_path=c)
+
+    def test_B28_fires_when_the_guard_is_gone(self):
+        """★ 守卫被删 —— 库里开始出现「算数但没人认领」的边。"""
+        hits = self._with_sources(
+            "def add_relation(conn, *, state, origin):\n"
+            "    return conn.execute('INSERT INTO relation (state) VALUES (?)',\n"
+            "                        (state,))\n",
+            _GOOD_PROMOTE)
+        self.assertTrue(_said(hits, "守卫被删"), hits)
+
+    def test_B28_fires_when_the_promote_update_writes_only_state(self):
+        """★ 只写 `state` 不写 `asserted_by` —— 那个中间状态能存在了。"""
+        hits = self._with_sources(
+            _GOOD_ADD_RELATION,
+            "def promote(conn, *, relation_id):\n"
+            "    conn.execute(\"UPDATE relation SET state = 'active'\"\n"
+            "                 \" WHERE id = ?\", (relation_id,))\n")
+        self.assertTrue(_said(hits, "没有同时写"), hits)
+
+    def test_B28_fires_when_the_promote_update_is_gone(self):
+        hits = self._with_sources(
+            _GOOD_ADD_RELATION,
+            "def promote(conn, *, relation_id):\n"
+            "    return relation_id\n")
+        self.assertTrue(_said(hits, "不见了"), hits)
+
+    def test_B28_is_quiet_on_the_clean_samples(self):
+        """反向：两份最小干净样本都不该被报 —— 否则上面几条验的不是那一条。"""
+        self.assertEqual(self._with_sources(_GOOD_ADD_RELATION, _GOOD_PROMOTE),
+                         [])
+
+    # --- 反向判据 --------------------------------------------------------
+
+    def test_B28_does_not_fire_on_the_real_modules(self):
+        """★ 真模块上一条都不许报。"""
+        self.assertEqual(checks.check_active_relations_are_claimed(), [])
 
 
 if __name__ == "__main__":

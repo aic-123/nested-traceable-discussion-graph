@@ -848,11 +848,31 @@ def add_relation(
     conn: sqlite3.Connection, *,
     kind: str, from_id: str, to_id: str,
     origin: str, state: str = "active",
+    asserted_by: str | None = None,
 ) -> int:
     """加一条结构边。**它有自己的身份、来源和状态。**
 
     `origin` 必填且区分人 / 机器 —— `§C2.4` 的「可计量」靠它：
     「AI 判定 vs 用户改判」的比例，分子分母都从这一列来。
+
+    --- 谁产的 vs 谁主张的（2026-09-29，迁移 v2）-------------------------------
+
+    两栏答两个问题，`origin` 答不了后一个：
+
+        origin       这条边**是谁产的**     （PROV-O wasGeneratedBy）
+        asserted_by  这条边**是谁主张的**   （PROV-O wasAttributedTo）
+
+    对**候选边**，这两个问题本来就该有两个答案：AI 提的（`origin="ai:…"`），
+    但**没人主张** —— 所以候选边的 `asserted_by` 必须是 `NULL`。它变成算数的
+    那一刻（`candidates.promote()`）才被认领，认领者写进这一栏。
+
+    两条守卫：
+
+    1. **算数的边必须有主张者**（`state == 'active'`）。缺省取 `origin` ——
+       人建的边、导入的边、上层派生边，建它的人就是主张它的人。
+    2. **还没算数的边不许有主张者**（`state != 'active'`）。给它写上，等于
+       系统替一条**还没被任何人认领**的边立论 —— 同 `add_artifact` 那条
+       「AI 档不许留空 `asserted_by`」，方向相反，禁的是同一件事。
 
     `state` 默认 `active`（`§C2.5` 派生标注：默认生效 + 可推翻）。
     ⚠️ 但**候选边不要走这里**：`candidates.record()` 的签名里没有 `state`，
@@ -865,11 +885,21 @@ def add_relation(
         raise ScaffoldError(f"未知 relation state：{state}")
     get(conn, from_id)
     get(conn, to_id)
+    who = (asserted_by or "").strip()
+    if state == "active":
+        who = who or origin
+    elif who:
+        raise ScaffoldError(
+            f"state={state!r} 的边不许有 asserted_by（收到 {who!r}）—— "
+            "一条还没算数的边被写上主张者，等于**系统替它立论**。"
+            "主张者要等它算数那一刻由提拔它的人写（candidates.promote()）。"
+        )
     now = _now()
     cur = conn.execute(
-        "INSERT INTO relation (kind, from_id, to_id, origin, state, created_at)"
-        " VALUES (?,?,?,?,?,?)",
-        (kind, from_id, to_id, origin, state, now),
+        "INSERT INTO relation"
+        " (kind, from_id, to_id, origin, state, asserted_by, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (kind, from_id, to_id, origin, state, who or None, now),
     )
     rid = int(cur.lastrowid)
     record_event(conn, "relation_added", origin, from_id,

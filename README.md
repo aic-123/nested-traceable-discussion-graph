@@ -27,9 +27,9 @@
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
 | `stop.py` | **停止条件** —— 拿 `policy` 的门槛判四件事。**只判不执行**：一句写语句都没有，四个动作都是应用层的开关 |
 | `upgrade.py` | **schema 升级** —— 只向前、不降级。一条升级要么全成、要么全不成（`executescript()` 会先隐式 COMMIT，所以逐句跑） |
-| `checks.py` | **27 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `checks.py` | **28 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
 | `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` / `test_upgrade.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 27 条检查**不是空转**的 |
+| `test_checks.py` | 证明那 28 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -517,9 +517,40 @@ upgrade.to_latest(conn)
 | 清单里没有 `DROP TABLE` / `DELETE FROM` | P6 可逆性：supersede 而非 delete |
 | import 白名单（不许 `scaffold`） | 升级要在**旧形状**上工作，而 `scaffold` 的函数假设的是新形状 |
 
-清单现在**是空的** —— 基线之后还没有一条需要走的升级。这不是没写完：
-被机制挡住的那条（给 `relation` 加 `asserted_by`）是**需求方的决定**，
-不是这一层的。
+清单现在有 **1 条**（v2：给 `relation` 加 `asserted_by`）—— 它是机制落地后
+走通的第一条真升级。
+
+⚠️ **基线 `SCHEMA` 一个字没改。** `scaffold.init()` 是
+`executescript(SCHEMA)` → `to_latest()`，所以若把这一栏也写进基线，
+新库会被迁移**再加一次** → `ALTER TABLE` 报 duplicate column。
+新栏**只由迁移叠加**。
+
+⚠️ **成熟做法是参考，不是照搬。** 取的是它们的**判断**，不是**步骤** ——
+每一步都得在本仓的约束下重新过一遍：
+
+| 成熟做法 | 它怎么说 | 本仓取什么 / 不取什么 |
+|---|---|---|
+| **expand-contract**（迁移手册里的通用模式） | 「先加（向后兼容）→ 迁数据 → 后删」 | **取前半**：加**可空**列，不动存量行。**不取后半**：不回填、不加 `NOT NULL` —— 存量行确实没有这个信息，回填就得**编一个值** |
+| **SQLite 官方 `ALTER TABLE`** | 加 `NOT NULL` 列**必须**带一个非 NULL 的 `DEFAULT` | **取它的结论**：正因为「必须带 `DEFAULT`」，这里才**不加 `NOT NULL`** —— 那个 `DEFAULT` 就是「没人主张」的位置，正是这一栏要挡的 |
+| **SQLite 官方 12 步改表流程** | 改列顺序 / 加删约束要「建新表 → 复制数据 → 删旧表 → 重命名新表」 | **不取**：它要 `DROP TABLE`，撞 B27（P6 可逆性：supersede 而非 delete）。所以新列只能排在末尾，不为对齐顺序去重建表 |
+| **RDF reification / RDF-star** | 「边上的属性」的经典答案：把边写成 statement，再给它挂属性 | **取它的诊断**（「边也能有自己的属性」），**不取它的形态**：那是 RDF 三元组的绕法；本仓是 property graph，边上直接加一栏就是它要的效果 |
+
+约束因此落在**函数级**（`add_relation()` 的两条守卫），不落在列上 ——
+而「落在函数级的东西会悄悄消失」，所以有 B28。
+
+### B28 守什么
+
+一栏加上了，还得有判据钉住**它的不变式** —— 否则那一栏只是一栏：
+
+| 判据 | 拦的是 |
+|---|---|
+| 基线 `SCHEMA` 里**没有**这一栏 | 两处都加 → 新库被迁移**再加一次** → `duplicate column`（**只在新库上出现**：老库走迁移，反而正常） |
+| **恰好一条**迁移加它 | 0 条 = 已有库上那栏不存在，而代码以为它在；2 条 = 同一件事做两遍 |
+| `add_relation` 的守卫骨架还在 | 守卫被删 → 一切照跑、用例照过，只是库里开始出现「算数但没人认领」的边 |
+| `promote` 的 UPDATE **同时**写 `state` 与 `asserted_by` | 分成两句 → 「算数了但没人认领」成为一个**能存在**的状态 |
+
+静态只看「那几样还在不在」，**不解析那两行对不对** —— 那半在行为用例里
+（`test_candidates` 的 `promote` 认领、`test_upgrade` 的迁移不丢数据）。
 
 ## 早期阶段它是**休眠**的
 
@@ -539,7 +570,7 @@ upgrade.to_latest(conn)
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 27 条否证检查
+python checks.py                      # 28 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
@@ -550,7 +581,7 @@ python -m unittest test_candidates    # 候选边不进读数 / 只有两条通�
 python -m unittest test_views         # 视图是缓存：重建幂等 / 重建删光都不动底层
 python -m unittest test_stop          # 停止条件只判不执行 / 判不了 ≠ 未触发
 python -m unittest test_upgrade       # 升级只向前 / 不降级 / 失败不留半成品
-python -m unittest test_checks        # 证明那 27 条检查不是空转
+python -m unittest test_checks        # 证明那 28 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -559,7 +590,7 @@ python -m unittest test_checks        # 证明那 27 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 27 条，B1, B10, ... 无命中。
+否证检查全部通过：共 28 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

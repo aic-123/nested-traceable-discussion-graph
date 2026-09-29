@@ -2173,6 +2173,27 @@ _UPGRADE_WRITER = "upgrade.py"
 # 那要**显式**改这条判据 —— 那是一次留痕的改动，不是顺手放宽。
 _UPGRADE_FORBIDDEN_SQL = ("DROP TABLE", "DELETE FROM")
 
+# 判据 6 扫禁令词之前，先用它把 `--` 行注释剥掉。
+#
+# ⚠️ **注释不是 SQL —— 它不执行，所以不该被这条判据拦。**
+# 不剥的话，「这条迁移为什么不用重建表」这类说明**根本写不出来**：
+# 一提那个词就被自己的检查拦住。实测踩到过：v2 的注释里写
+# 「不为了对齐顺序去重建表（那要动 B27 的 DROP TABLE 禁令）」，
+# 于是判据 6 报「v2 的 SQL 里有 DROP TABLE」—— 拦住的是一句**说明**。
+#
+# 手法同 `upgrade._has_sql()`：那里也是先剥注释，才判「这句还剩什么」。
+_UPGRADE_SQL_COMMENT = re.compile(r"--[^\n]*")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """剥掉 `--` 行注释。
+
+    ⚠️ 剥注释只减少误报，**不增加漏报**：禁令词若真出现在 SQL 里
+    （哪怕藏在字符串字面量里），剥完仍在结果里，照拦。
+    """
+    return _UPGRADE_SQL_COMMENT.sub("", sql)
+
+
 # `scaffold.init()` 的函数体里必须真的调它。
 # 忘了调 = 新库建完**不被标记版本**，于是第一次真迁移时，
 # 这个库会被当成「需要从基线重跑」。
@@ -2314,8 +2335,11 @@ def check_upgrades_are_forward_only_and_safe(
                      "直到第一次真迁移时被当成「需要从基线重跑」。")
 
     # 6 迁移 SQL 里没有破坏性语句
+    #
+    # ⚠️ **先剥注释再扫。** 注释不是 SQL，它不执行 —— 判据不该拦一句说明。
+    # 剥法见 `_strip_sql_comments()`：只减误报，不减漏报。
     for m in upgrades:
-        body = (m.sql or "").upper()
+        body = _strip_sql_comments(m.sql or "").upper()
         for bad in _UPGRADE_FORBIDDEN_SQL:
             if bad in body:
                 flag(f"v{m.version} 的 SQL 里有 `{bad}` —— P6 可逆性要求"
@@ -2328,6 +2352,119 @@ def check_upgrades_are_forward_only_and_safe(
         flag(f"import 了 {extra}，不在白名单 {sorted(allowed_imports)} 里 —— "
              "尤其不许 import `scaffold`：迁移要在**旧形状**上工作，"
              "而 scaffold 的函数假设的是**新形状**。")
+
+    return hits
+
+
+# --- B28（`relation.asserted_by` 那条不变式）用的常量 --------------------------
+
+# 守卫骨架：`add_relation` 里这三样必须都在。
+#
+# 为什么判「三样都在」而不是解析那两行对不对：静态能看的是**还在不在**，
+# 「写得对不对」是行为用例的活（`test_provenance` / `test_candidates`）。
+# 这条要拦的是「有人顺手把守卫删了」—— 那种改动不会让任何用例变红，
+# 只会让库里开始出现「算数但没人认领」的边。
+_CLAIMED_GUARD_TOKENS = ('state == "active"', "asserted_by",
+                         "raise ScaffoldError")
+
+# 加这一栏的那条迁移，SQL 里必须出现这一段。
+_CLAIMED_ADD_COLUMN = re.compile(
+    r"ALTER\s+TABLE\s+relation\s+ADD\s+COLUMN\s+asserted_by\b", re.I)
+
+
+def check_active_relations_are_claimed(
+    *,
+    schema: str | None = None,
+    upgrades: tuple | None = None,
+    scaffold_path: Path | None = None,
+    candidates_path: Path | None = None,
+) -> list[tuple[str, int, str]]:
+    """「算数的边必须有主张者」—— 一栏加上了，还得有判据钉住它。
+
+    `upgrade.py` 的 v2 只是让 `relation.asserted_by` **存在**。
+    「`active` 的边不许 `asserted_by IS NULL`」是**另一件事**：
+    它没有 schema 级约束（列是可空的 —— 理由见 v2 的注释：
+    `ADD COLUMN` 加 `NOT NULL` 必须带 `DEFAULT`，而那个 `DEFAULT`
+    正是「没人主张」的位置，也就是这一栏要挡的东西）。所以只能靠代码守。
+
+    而代码守的东西会**悄悄消失**：删掉 `add_relation` 里那几行守卫，
+    一切照跑、所有用例照过，只是库里开始出现「算数但没人认领」的边 ——
+    那正是这一栏要挡的状态，而它看起来完全正常。
+
+    四条判据：
+
+    | # | 判据 | 拦的是 |
+    |---|---|---|
+    | 1 | 基线 `SCHEMA` 的 `relation` 建表段**不含** `asserted_by` | 在 `SCHEMA` 里也加 → 新库被迁移**再加一次** → `duplicate column` |
+    | 2 | `UPGRADES` 里**恰好一条**迁移加它 | 0 条 → 已有库上那栏不存在（代码以为它在）；2 条 → 同一件事做两遍 |
+    | 3 | `add_relation` 的函数体里三样守卫骨架都在 | 守卫被删 → 库里出现「算数但没人认领」的边 |
+    | 4 | `promote` 的 `UPDATE relation` 那一句**同时**含 `state` 与 `asserted_by` | 分成两句写 → 「算数了但没人认领」成为一个**能存在**的状态 |
+
+    ⚠️ **静态拦不住什么**（同 B14 / B18 / B20 / B22 / B23 / B24 / B25 / B26 / B27
+    的既有立场）：判据 3 只看「三样还在不在」，**不解析那两行对不对**；
+    判据 4 只看「一句里有没有那两栏」，不看值取得对不对。
+    那半在行为用例里：`test_provenance` 的 AI 档归因、
+    `test_candidates` 的 `promote` 认领、`test_upgrade` 的迁移不丢数据。
+
+    ⚠️ 四个参数只为 `test_checks.py` 能注入假值证明这条**不空转** ——
+    它扫的是三个**固定文件**，喂 `_tmp_probe_zzz.py` 到不了它。
+    """
+    schema = scaffold.SCHEMA if schema is None else schema
+    upgrades = upgrade.UPGRADES if upgrades is None else upgrades
+    scaffold_path = scaffold_path or (ROOT / "scaffold.py")
+    candidates_path = candidates_path or (ROOT / "candidates.py")
+
+    hits: list[tuple[str, int, str]] = []
+
+    # 1 基线 SCHEMA 里没有这一栏
+    m = re.search(r"CREATE TABLE IF NOT EXISTS relation\b.*?\);",
+                  schema, re.S | re.I)
+    if m is None:
+        hits.append((scaffold_path.name, 1,
+                     "`scaffold.SCHEMA` 里找不到 `relation` 的建表语句 —— "
+                     "这条判据的前提没了，它现在是**空转**的。"))
+    elif "asserted_by" in m.group(0):
+        hits.append((scaffold_path.name, 1,
+                     "基线 SCHEMA 的 `relation` 建表段里有 `asserted_by` —— "
+                     "新栏只能由迁移加：`init()` = `SCHEMA` + `to_latest()`，"
+                     "两处都加的话新库会被迁移**再加一次**，"
+                     "`ALTER TABLE` 报 duplicate column。"))
+
+    # 2 恰好一条迁移加它
+    adders = [u.version for u in upgrades
+              if _CLAIMED_ADD_COLUMN.search(u.sql or "")]
+    if len(adders) != 1:
+        hits.append(("upgrade.py", 1,
+                     f"加 `relation.asserted_by` 的迁移有 {len(adders)} 条"
+                     f"（{['v%d' % v for v in adders]}），必须**恰好一条** —— "
+                     "0 条：已有库上那栏不存在，而代码以为它在；"
+                     "2 条：同一件事做两遍。"))
+
+    # 3 add_relation 的守卫骨架还在
+    body, _start = _function_body(scaffold_path, "add_relation")
+    joined = "\n".join(t for _n, t in body)
+    missing = [t for t in _CLAIMED_GUARD_TOKENS if t not in joined]
+    if missing:
+        hits.append((scaffold_path.name, 1,
+                     f"`add_relation` 的函数体里少了 {missing} —— "
+                     "「算数的边必须有主张者」这条守卫被删了。删掉之后"
+                     "一切照跑，只是库里开始出现「算数但没人认领」的边，"
+                     "而它看起来完全正常。"))
+
+    # 4 promote 的那一句 UPDATE 同时写两栏
+    body, _start = _function_body(candidates_path, "promote")
+    updates = [t for _n, t in body if "update relation" in t.lower()]
+    if not updates:
+        hits.append((candidates_path.name, 1,
+                     "`promote` 的函数体里没有 `UPDATE relation` —— "
+                     "候选边变成算数的那一步不见了。"))
+    for line in updates:
+        if "state" not in line or "asserted_by" not in line:
+            hits.append((candidates_path.name, 1,
+                         f"`promote` 的 UPDATE 没有同时写 `state` 与 "
+                         f"`asserted_by`：{line.strip()!r} —— 分成两句写的话，"
+                         "「算数了但没人认领」会成为一个**能存在**的状态，"
+                         "而 `add_relation` 的守卫拦的正是它。"))
 
     return hits
 
@@ -2384,6 +2521,8 @@ def all_checks():
            "§5.4 停止条件 · 2026-09-29", check_stop_conditions_cannot_act_on_their_own)
     yield ("B27", "schema 迁移只向前且不许把库弄坏（版本号递增连续、只一处能写、init 真的调了 to_latest、迁移里没有 DROP/DELETE）",
            "§11.1 阻塞点 · 2026-09-29", check_upgrades_are_forward_only_and_safe)
+    yield ("B28", "算数的边必须有主张者（relation.asserted_by 的守卫还在，且新栏只由一条迁移加）",
+           "§11.5 · 2026-09-29", check_active_relations_are_claimed)
 
 
 def main() -> int:

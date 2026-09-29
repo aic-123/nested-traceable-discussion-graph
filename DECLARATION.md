@@ -2837,15 +2837,100 @@ B14 只拦**直笔**（直接写 SQL）；走 `scaffold.revise()` 的**间接写
 | 检查 | `checks.py` **B27**（7 条判据，追加在 B26 之后） |
 | 测试 | `test_upgrade.py`（38 条，八组）+ `test_checks.py::TestB27Fires`（18 条） |
 
-**验证**：`checks.py` **27/27** 干净（原 15 条一条未改）·
-`test_upgrade` 38 · `test_checks` 196（skipped 8）全过，全套 **478**。
+**验证**：`checks.py` **28/28** 干净（原 15 条一条未改）·
+`test_upgrade` 38 · `test_checks` 205（skipped 8）全过，全套 **487**。
 
 ### 23.6 边界
 
 - 静态拦不住「一条升级的 SQL **写错了**」—— 那是 `test_upgrade.py` 的活。
   B27 盯的是**清单的形状**与**唯一的写口**。
-- 清单现在**是空的**：基线之后还没有一条需要走的升级。这不是没写完 ——
-  第一条真升级要由 §23.1 说的那个**需求方决定**带出来。
+- 清单现在有 **1 条**（v2：给 `relation` 加 `asserted_by`）—— 它由
+  §23.1 说的那个**需求方决定**带出来了（2026-09-29 同一天）。见 §24。
 - 迁移清单**只许追加，不许改已发布的那几条**：改它等于同一个版本号在
   两台机器上做不同的事，而版本号已经抬过去了，谁也看不出来。这一条
   **静态拦不住**（「已发布」不是源码里的属性），只能靠这条规矩本身。
+
+---
+
+## §24 给边加一栏 `asserted_by`：不变式落不到列上，就落到函数上（2026-09-29）
+
+### 24.1 它补的是哪个洞
+
+`artifact`（节点）上两栏答两个不同的问题，`relation`（边）上只有一栏：
+
+| | 节点 | 边 |
+|---|---|---|
+| 「内容怎么产生的」 | `digital_source_type`（IPTC 词表） | —— |
+| 「谁主张的」 | `asserted_by` | **——（本次补上）** |
+| 「谁产生这条记录的」 | `origin` | `origin` |
+
+于是「这条**算数的**边是谁认领的」只能去 `event` 表 join `candidate_promoted`
+才查得到 —— 而那是**历史事件**，不是边自己的属性。
+
+### 24.2 成熟做法是参考，不是照搬
+
+这个变更落在 **expand-contract** 的第一步。**只取第一步**：
+
+| 成熟做法 | 取没取 | 理由 |
+|---|---|---|
+| 先加**可空**列（向后兼容） | **取** | 旧代码读新库不会崩 |
+| 加 `DEFAULT` 填存量行 | **不取** | 给 `DEFAULT` 等于给「没人主张」留了个位置 —— 那正是这一栏要挡的 |
+| 回填 + `SET NOT NULL`（contract 阶段） | **不取** | 存量行**确实没有**这一栏的信息，回填就得**编一个值** |
+
+⚠️ SQLite 的 `ALTER TABLE ADD COLUMN` 加 `NOT NULL` 列**必须带非 NULL 的
+`DEFAULT`**（官方原文："If a NOT NULL constraint is specified, then the column
+must have a default value other than NULL."）—— 所以「列上不加约束」不是偷懒，
+是**没有别的选择**。
+
+另一族参考是 **RDF reification / RDF-star**（「边上的属性」的标准答案）。
+本仓的 `asserted_by` 就是 **property graph 的边属性** —— RDF 传统上要写成
+statements about statements，RDF-star 更紧凑。**不照搬**：那套解决的是
+「在只有三元组的数据模型里怎么表达」，而本仓的表本来就能给边加列。
+
+### 24.3 不变式落不到列上，就落到函数上
+
+列是可空的，所以「算数的边必须有主张者」只能靠代码守 ——
+`scaffold.add_relation()` 的两条守卫：
+
+* `state == 'active'` → **必须有主张者**（缺省取 `origin`）
+* `state != 'active'` → **不许有主张者**
+
+第二条和 `add_artifact` 那条「AI 档不许留空 `asserted_by`」是**同一件事的反面**：
+两条禁的都是 —— **一条还没算数的边被写上主张者，等于系统替它立论。**
+
+`candidates.promote()` 的那一句 `UPDATE` **同时**写 `state` 与 `asserted_by`。
+分成两句写的话，「算数了但没人认领」会成为一个**能存在**的状态。
+
+### 24.4 B28 守什么（4 条）
+
+| # | 判据 | 拦的是 |
+|---|---|---|
+| 1 | 基线 `SCHEMA` 的 `relation` 建表段**不含** `asserted_by` | 在 `SCHEMA` 里也加 → 新库被迁移**再加一次** → `duplicate column` |
+| 2 | `UPGRADES` 里**恰好一条**迁移加它 | 0 条 → 已有库上那栏不存在（代码以为它在）；2 条 → 同一件事做两遍 |
+| 3 | `add_relation` 的函数体里三样守卫骨架都在 | 守卫被删 → 库里出现「算数但没人认领」的边 |
+| 4 | `promote` 的 `UPDATE relation` 那一句**同时**含 `state` 与 `asserted_by` | 分成两句写 → 「算数了但没人认领」成为一个**能存在**的状态 |
+
+⚠️ **静态拦不住什么**（同 B14 / B18 / B20 / B22 / B23 / B24 / B25 / B26 / B27
+的既有立场）：判据 3 只看「三样还在不在」，不解析那两行对不对；判据 4 只看
+「一句里有没有那两栏」，不看值取得对不对。那半在行为用例里：
+`test_provenance` 的 AI 档归因、`test_candidates` 的 `promote` 认领、
+`test_upgrade` 的迁移不丢数据。
+
+### 24.5 交付物
+
+| 层 | 落在哪 |
+|---|---|
+| 迁移 | `upgrade.py` 的 `UPGRADES` v2（**基线 `SCHEMA` 一个字没改**） |
+| 守卫 | `scaffold.add_relation()` 两条 |
+| 认领 | `candidates.promote()` 的那一句 `UPDATE` |
+| 检查 | `checks.py` **B28**（4 条判据，追加在 B27 之后） |
+| 用例 | `test_checks.py::TestB28Fires`（9 条）、`test_candidates.py`、`test_upgrade.py` |
+
+### 24.6 边界
+
+- **这一栏只由迁移加。** `scaffold.init()` = `executescript(SCHEMA)` → `to_latest()`，
+  两处都加的话新库会被迁移**再加一次**。
+- **存量边留 `NULL`。** 它们确实没有这一栏的信息，回填就得编一个值。
+- **列只能排在末尾。** `ALTER TABLE ADD COLUMN` 没有位置参数，不为了对齐
+  `artifact` 表里 `asserted_by` 的位置去重建表（那要 `DROP TABLE`，撞 B27 判据 6）。
+  按列名取值不受影响。
