@@ -71,10 +71,16 @@ B24 把「`CANDIDATE_STATE` 真的在 `RELATION_STATES` 里」钉成判据：
 所以 `origin` 必须带 `ORIGIN_PREFIXES` 里的一个前缀，判不出就抛。
 
 ⚠️ 为什么不给 `relation` 补一栏 `asserted_by`（工程稿 §11.5 的另一条路）：
-本仓**没有迁移机制** —— 没有 `schema_version`、没有 `ALTER TABLE`、
-没有 `PRAGMA user_version`。`relation` 是 `CREATE TABLE IF NOT EXISTS` 建的，
+当时**本仓没有迁移机制** —— 没有 `schema_version`、没有 `ALTER TABLE`、
+没有版本号。`relation` 是 `CREATE TABLE IF NOT EXISTS` 建的，
 所以往 DDL 里加一列，对**已有的库静默失效**：代码以为那栏在，库里没有。
 而历史数据回填不了，只能留 `NULL` —— 于是「必填」**再落空一次**。
+
+⚠️ **2026-09-29 更正**：迁移机制已经补上了（`upgrade.py` + B27）。
+上面那条理由**不再是「做不到」**，而是回到它本来的性质 ——
+「用入口词表补，不加列」是**需求方的决定**（工程稿 §11.5），
+不是被基础设施挡住的。机制补上之后，「加一栏」从**走不通**变成
+**有路，但要走一条留痕的路**；要不要走，由那个决定说了算。
 
 ⚠️ 为什么不做成「文档里写一句约定」：约定不是词表。`record()` 是候选边
 **唯一的入口**，在入口上判一次，复用的就是本模块已经用过的两种手法

@@ -26,9 +26,10 @@
 | `views.py` | **物化视图** —— 局部展开的**纯读缓存**（CQRS read model）。除了视图表，一句写语句都没有 |
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
 | `stop.py` | **停止条件** —— 拿 `policy` 的门槛判四件事。**只判不执行**：一句写语句都没有，四个动作都是应用层的开关 |
-| `checks.py` | **26 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 26 条检查**不是空转**的 |
+| `upgrade.py` | **schema 升级** —— 只向前、不降级。一条升级要么全成、要么全不成（`executescript()` 会先隐式 COMMIT，所以逐句跑） |
+| `checks.py` | **27 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` / `test_upgrade.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 27 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -447,6 +448,79 @@ stop.judge(conn, declared={"unfaithful": []})   # → clear：查过了，没问
 `observe()` 是「只记」那一半（纯读、不做任何比较），`judge()` 是过门槛那一半。
 两半都**不碰内容结构**，观测量也不进 `upper.COUNT_SIGNALS`（B26 判据 5 钉着）。
 
+## 迁移只向前，而且不许把库弄坏
+
+`upgrade.py` 让「往 schema 里加一栏」这件事**有路可走**。在那之前它走不通 ——
+本仓没有 `schema_version`、没有 `ALTER TABLE`、没有版本号，
+而往 DDL 里加一列对**已有的库静默失效**：代码以为那栏在，库里没有。
+
+版本号用 SQLite 原生的 `user_version`：
+
+```python
+import upgrade
+
+upgrade.current_version(conn)   # 0 = 机制引入之前建的库；1 = 基线；n = 跑完第 n 条
+upgrade.plan(conn)              # 只读：给人看要跑什么
+upgrade.to_latest(conn)         # 跑，返回**实际跑过的**版本号
+```
+
+```
+当前 v1，最新 v1
+没有待跑的迁移
+```
+
+**为什么不建一张 `schema_version` 表**：那张表会出现在 `scaffold.SCHEMA` 里，
+而 B25 判据 4 要求视图层的表集合**恰好等于**它 —— 加一张表就要动视图那套。
+版本号是**库自己的元数据**，不是讨论内容。
+
+### 0 和 1 是同一个形状
+
+| 版本 | 意思 |
+|---|---|
+| `0` | 机制引入**之前**建的库 |
+| `1` | 基线 —— `scaffold.SCHEMA` 定义的那个形状 |
+| `n` | 跑完了第 n 条升级 |
+
+`0 → 1` 是**标记**，不是升级：`SCHEMA` 里全是 `CREATE TABLE IF NOT EXISTS`，
+现存库就是它建的。把 0 认成「需要从零重建」会去动一个本来没坏的库。
+
+### 只向前，不降级
+
+版本号**大于**最新版本时，`to_latest()` **拒绝**：
+
+```python
+upgrade.to_latest(conn)
+# UpgradeError: 这个库是 v5，而这份代码只到 v1 —— 拒绝降级。
+```
+
+「未来版本」的库被当成旧库改，会**安静地**弄坏新加的东西：库还能开、
+大部分查询还能跑，只有那一栏不见了。拒绝比猜安全。
+
+### 一条升级要么全成，要么全不成
+
+⚠️ 这里不能用 `executescript()` —— 它会**先隐式 COMMIT 再执行**。
+用它跑升级 = 每条语句各自落盘，跑到一半失败就留下「前几条生效、
+后几条没生效」的库，而版本号还没抬 —— 下次会从同一条重来，
+**把已经生效的那几条再做一遍**。那不是幂等，那是重复施加。
+
+所以逐句 `execute()`，整条升级（含抬版本号）在一个事务里。
+
+### B27 守什么
+
+| 判据 | 拦的是 |
+|---|---|
+| 版本号递增、连续、从基线 + 1 起 | 跳号 —— 多半是**删掉了一条已发布的升级**，两台机器版本号相同、形状不同 |
+| 版本号两两不同 | 重复号 = **重复施加**（第二条以为库还在上一版） |
+| 名字非空且两两不同 | 事后翻库只能看到一个数字 |
+| 版本号只许 `upgrade.py` 一个文件写 | 两处都能抬，两边都会觉得自己是对的 |
+| `init()` 真的调了 `to_latest()` | 忘了调，新库**照样能用**，直到第一次升级时被当成「从基线重跑」 |
+| 清单里没有 `DROP TABLE` / `DELETE FROM` | P6 可逆性：supersede 而非 delete |
+| import 白名单（不许 `scaffold`） | 升级要在**旧形状**上工作，而 `scaffold` 的函数假设的是新形状 |
+
+清单现在**是空的** —— 基线之后还没有一条需要走的升级。这不是没写完：
+被机制挡住的那条（给 `relation` 加 `asserted_by`）是**需求方的决定**，
+不是这一层的。
+
 ## 早期阶段它是**休眠**的
 
 这是一个**可证伪的预言**，不是免责声明：
@@ -465,7 +539,7 @@ stop.judge(conn, declared={"unfaithful": []})   # → clear：查过了，没问
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 26 条否证检查
+python checks.py                      # 27 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
@@ -475,7 +549,8 @@ python -m unittest test_contribute    # 七种贡献粒度逐个可建 / 空库�
 python -m unittest test_candidates    # 候选边不进读数 / 只有两条通路能把它变算数
 python -m unittest test_views         # 视图是缓存：重建幂等 / 重建删光都不动底层
 python -m unittest test_stop          # 停止条件只判不执行 / 判不了 ≠ 未触发
-python -m unittest test_checks        # 证明那 26 条检查不是空转
+python -m unittest test_upgrade       # 升级只向前 / 不降级 / 失败不留半成品
+python -m unittest test_checks        # 证明那 27 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -484,7 +559,7 @@ python -m unittest test_checks        # 证明那 26 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 26 条，B1, B10, ... 无命中。
+否证检查全部通过：共 27 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

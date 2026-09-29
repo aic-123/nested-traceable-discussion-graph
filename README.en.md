@@ -26,9 +26,10 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | `views.py` | **Materialized views** — local expansion as a **pure read cache** (CQRS read model). Outside the view table it contains not a single write statement |
 | `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
 | `stop.py` | **Stop conditions** — judges four things against `policy`'s lines. **Judges only, never acts**: not a single write statement, and all four actions belong to the application layer |
-| `checks.py` | **26 falsification checks. Each one is executable**, not an adjective in a doc |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
-| `test_checks.py` | Proves those 26 checks **aren't vacuous** |
+| `upgrade.py` | **schema upgrades** — forward only, never downgrades. An upgrade applies fully or not at all |
+| `checks.py` | **27 falsification checks. Each one is executable**, not an adjective in a doc |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` / `test_stop.py` / `test_upgrade.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
+| `test_checks.py` | Proves those 27 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -351,6 +352,88 @@ The last two arrive via `declared`, and what arrives are **observations, not con
 
 `§八` splits P7 into two columns: **observation points only record** (they may never be compared against a number), **`POLICY` only triggers actions**. `observe()` is the recording half (pure reads, no comparisons at all); `judge()` is the threshold half. Neither touches content structure, and the observed counts never enter `upper.COUNT_SIGNALS` (B26 criterion 5 pins this).
 
+## Upgrades go forward only, and must not damage the library
+
+`upgrade.py` makes "add a column to the schema" **a road you can take**. Before it,
+there was no road: no `schema_version`, no `ALTER TABLE`, no version number at all —
+and a column added to the DDL **silently misses existing libraries**: the code
+believes the column is there, the library does not have it.
+
+The version number uses SQLite's built-in `user_version`:
+
+```python
+import upgrade
+
+upgrade.current_version(conn)   # 0 = built before this mechanism; 1 = baseline; n = ran the n-th upgrade
+upgrade.plan(conn)              # read-only: what would run, for a human
+upgrade.to_latest(conn)         # run it, returns the versions **actually applied**
+```
+
+```
+当前 v1，最新 v1
+没有待跑的迁移
+```
+
+**Why not a `schema_version` table**: that table would show up in `scaffold.SCHEMA`,
+and B25 criterion 4 requires the view layer's table set to be **exactly** equal to it —
+adding a table would drag the whole view layer along. The version number is the
+**library's own metadata**, not discussion content.
+
+### 0 and 1 are the same shape
+
+| Version | Meaning |
+|---|---|
+| `0` | A library built **before** this mechanism existed |
+| `1` | The baseline — the shape `scaffold.SCHEMA` defines |
+| `n` | The n-th upgrade has been applied |
+
+`0 → 1` is a **stamp**, not an upgrade: `SCHEMA` is entirely
+`CREATE TABLE IF NOT EXISTS`, and existing libraries were built by it.
+Treating 0 as "needs a rebuild from scratch" would go and touch a library
+that was never broken.
+
+### Forward only, never downgrade
+
+When the version number is **greater** than the latest one, `to_latest()` **refuses**:
+
+```python
+upgrade.to_latest(conn)
+# UpgradeError: 这个库是 v5，而这份代码只到 v1 —— 拒绝降级。
+```
+
+A library from a "future version" treated as an old one gets damaged **quietly**:
+it still opens, most queries still run, only that one column is gone.
+Refusing is safer than guessing.
+
+### An upgrade applies fully or not at all
+
+⚠️ `executescript()` **cannot** be used here — it **commits first, then executes**.
+Using it to run upgrades means each statement lands on its own; a failure halfway
+leaves a library where "the first few took effect, the rest did not" while the
+version number was never raised — so the next run starts from the same upgrade again
+and **re-applies the ones that already took effect**. That is not idempotence,
+that is double application.
+
+So statements run one at a time via `execute()`, and the whole upgrade
+(including the version bump) sits in a single transaction.
+
+### What B27 guards
+
+| Criterion | What it stops |
+|---|---|
+| Versions increase, are contiguous, start at baseline + 1 | A gap — usually a **deleted, already-published upgrade**: two machines share a version number and differ in shape |
+| Versions are pairwise distinct | A duplicate number = **double application** (the second one thinks the library is still on the previous version) |
+| Names are non-empty and pairwise distinct | Otherwise a library only shows a number afterwards |
+| Only `upgrade.py` may write the version number | If two places can raise it, both will believe they are right |
+| `init()` really calls `to_latest()` | Forget it and a new library **still works** — until the first real upgrade treats it as "needs to re-run from the baseline" |
+| No `DROP TABLE` / `DELETE FROM` in the checklist | P6 reversibility: supersede, never delete |
+| An import allow-list (no `scaffold`) | Upgrades work on the **old** shape, while `scaffold`'s functions assume the new one |
+
+The checklist is currently **empty** — after the baseline there is not yet an upgrade
+to run. That is not "unfinished": the one thing the mechanism was blocking
+(adding `asserted_by` to `relation`) is a **decision for the requirements owner**,
+not for this layer.
+
 ## On a young corpus it is **dormant**
 
 This is a **falsifiable prediction**, not a disclaimer:
@@ -369,7 +452,7 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 26 falsification checks
+python checks.py                      # the 27 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
 python -m unittest test_pointer       # locators: position only, never the body
 python -m unittest test_staging       # intake gate: no gate, no `active`
@@ -379,7 +462,8 @@ python -m unittest test_contribute    # seven granularities, each creatable / em
 python -m unittest test_candidates    # a candidate is never counted / only two routes make it count
 python -m unittest test_views         # a view is a cache: idempotent, and it never moves the lower layer
 python -m unittest test_stop          # stop conditions judge only / "cannot judge" ≠ "did not trigger"
-python -m unittest test_checks        # proves those 26 checks aren't vacuous
+python -m unittest test_upgrade       # forward only / no downgrade / a failed upgrade leaves nothing behind
+python -m unittest test_checks        # proves those 27 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:
@@ -388,7 +472,7 @@ python -m unittest test_checks        # proves those 26 checks aren't vacuous
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 26 条，B1, B10, ... 无命中。
+否证检查全部通过：共 27 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` skips 7 tests** — output is `OK (skipped=7)`. This is **intentional**:

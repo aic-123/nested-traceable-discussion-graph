@@ -41,6 +41,7 @@ from pathlib import Path
 # 且只用标准库。
 import candidates
 import contribute
+import upgrade
 import pointer
 import policy
 import rules
@@ -2133,6 +2134,204 @@ def check_stop_conditions_cannot_act_on_their_own(
     return hits
 
 
+# ---------------------------------------------------------------------------
+# B27 —— schema 迁移只向前，且不许把库弄坏
+# ---------------------------------------------------------------------------
+
+# 本模块 import 了哪些**顶层**模块。
+#
+# ⚠️ 特别地，**不许 import `scaffold`** —— 两个理由：
+# ① `scaffold` 反过来 import 本模块（`init()` 要调 `to_latest()`），成环；
+# ② 更要紧的是**语义**：迁移要在**旧形状**上工作，而 `scaffold` 里的函数
+#    （`add_artifact` / `record` / `activate`）假设的是**新形状** ——
+#    它们会去读那些旧库里还不存在的栏。拿新形状的函数去改旧形状的库，
+#    会在第一次调用时抛在某个想都想不到的地方。
+#    所以迁移**只碰 SQL**。
+# 白名单写法的好处同 B26：将来新增一个模块，**默认是被挡住的**。
+_UPGRADE_ALLOWED_IMPORTS = ("__future__", "re", "sqlite3", "typing")
+
+# 版本号的**写**只许出现在 `upgrade.py` 里。
+# 这是 B20「一张表只许一个文件写」的同一个手法：两处都能抬版本号的话，
+# 一处抬到 3、另一处以为还是 1，而**两边都觉得自己是对的**。
+_UPGRADE_VERSION_WRITE = re.compile(r"PRAGMA\s+user_version\s*=")
+
+# 唯一被允许写版本号的那个文件。
+#
+# ⚠️ 这里写的是**固定名字**，不是 `source_path.name`。
+# 探针（`test_checks.py` 的 `_b27_probe`）会把 `source_path` 指到
+# `_tmp_probe_zzz.py` —— 那时若按 `source_path.name` 排除，
+# **真的 `upgrade.py` 就成了「别的文件」**，而它抬版本号是它的活，
+# 于是每一条探针用例都会多报一笔，把真正要验的那条淹掉。
+# （这个 bug 被 `test_B27_is_quiet_on_an_additive_migration` 抓出来过。）
+_UPGRADE_WRITER = "upgrade.py"
+
+# 迁移 SQL 里不许出现这两样。
+#
+# 依据是 P6 可逆性（工程稿 §八）——「supersede 而非 delete」。
+# 一条 `DELETE FROM` 抹掉的东西，版本号抬上去之后**没有任何办法找回来**；
+# `DROP TABLE` 更彻底。真需要重建表（SQLite 改一栏要 12 步）时，
+# 那要**显式**改这条判据 —— 那是一次留痕的改动，不是顺手放宽。
+_UPGRADE_FORBIDDEN_SQL = ("DROP TABLE", "DELETE FROM")
+
+# `scaffold.init()` 的函数体里必须真的调它。
+# 忘了调 = 新库建完**不被标记版本**，于是第一次真迁移时，
+# 这个库会被当成「需要从基线重跑」。
+_UPGRADE_TO_LATEST_FN = "to_latest"
+
+# 造场景用的测试夹具不受「版本号只许一处写」约束 —— 见判据 4 的说明。
+_UPGRADE_VERSION_WRITE_EXEMPT = ("test_",)
+
+
+def check_upgrades_are_forward_only_and_safe(
+    *, source_path: Path | None = None, scaffold_path: Path | None = None,
+    upgrades: tuple | None = None, baseline: int | None = None,
+    allowed_imports: tuple = _UPGRADE_ALLOWED_IMPORTS,
+    root: Path | None = None,
+) -> list[tuple[str, int, str]]:
+    """schema 迁移**只向前**，且不许把库弄坏（贯穿项 · 工程稿 §11.1 末尾）。
+
+    这个模块补上的是工程稿点名过的阻塞点：「往 schema 里加一栏」原先**走不通**。
+    补上之后它有路可走了 —— 于是新的失败方式出现了：**走的时候把库弄坏**。
+
+    判据：
+
+    1. ★ 迁移清单的版本号**严格递增**、**两两不同**、且从 `基线 + 1` 起**连续**。
+       跳号最常见的原因不是笔误，是**删掉了一条已经发布过的迁移** ——
+       那个版本号在别的机器上已经抬过去了，于是两台机器的 `user_version`
+       相同、形状不同，**谁也看不出来**。
+    2. ★ `BASELINE_VERSION` 是 1，且清单里**没有**落在基线或之前的条目。
+       基线没有「迁移」，它是**标记**：`SCHEMA` 里全是
+       `CREATE TABLE IF NOT EXISTS`，现存库就是它建的。
+    3. ★ 每条迁移的名字**非空**且**两两不同**。
+       没有名字，事后翻库只能看到一个数字；两条迁移重名，出事时指不清是哪一条。
+    4. ★ `PRAGMA user_version` 的**写**只出现在 `upgrade.py` 一个文件里。
+       两处都能抬版本号的话，一处抬到 3、另一处以为还是 1，而两边都觉得自己是对的。
+       ⚠️ **测试文件（`test_*.py`）豁免** —— 判据 5 要造「未来版本的库」这种场景，
+       那是夹具，不是推进路径。代价照实说：**藏一个写版本号的生产文件进
+       `test_` 前缀就能绕过这条**，但那已经不算隐藏了，算明着改名。
+    5. ★ `scaffold.init()` 的函数体里**真的调了** `upgrade.to_latest()`。
+       忘了调，新库建完不被标记版本 —— 而它**照样能用**，
+       直到第一次真迁移时被当成「需要从基线重跑」。
+       （手法同 B24 判据 5、B25 判据 5、B26 判据 9。）
+    6. ★ 迁移 SQL 里没有 `DROP TABLE` / `DELETE FROM`（P6 可逆性）。
+    7. ★ import 白名单：只许 `_UPGRADE_ALLOWED_IMPORTS` 里的。
+       **尤其不许 `scaffold`** —— 迁移要在旧形状上工作，而 scaffold 的函数
+       假设的是新形状（见常量区的说明）。
+
+    ⚠️ 静态拦不住什么，说清楚（同 B14 / B18 / B20 / B22 / B23 / B24 / B25 / B26 的既有立场）：
+    它拦不住「一条迁移的 SQL **写错了**」—— 那是 `test_upgrade.py` 的活
+    （幂等 / 不丢数据 / 事务性）。这条盯的是**清单的形状**与**唯一的写口**。
+    """
+    source_path = source_path or (ROOT / "upgrade.py")
+    is_real = source_path.name == "upgrade.py"
+    if is_real and not source_path.is_file():
+        return [("upgrade.py", 1,
+                 "迁移层不在 —— 工程稿 §11.1 那个阻塞点（「往 schema 里加东西」"
+                 "走不通）没有落点。")]
+
+    upgrades = upgrade.UPGRADES if upgrades is None else upgrades
+    baseline = upgrade.BASELINE_VERSION if baseline is None else baseline
+    scaffold_path = scaffold_path or (ROOT / "scaffold.py")
+    root = root or ROOT
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, n: int = 1) -> None:
+        hits.append((source_path.name, n, msg))
+
+    # 1 版本号：递增 / 不重复 / 从基线 + 1 起连续
+    versions = [m.version for m in upgrades]
+    if versions != sorted(versions):
+        flag(f"清单不是按版本号递增排的：{versions} —— `to_latest()` 会自己排序，"
+             "所以**不会报错**，只会让读清单的人以为它是另一种顺序。")
+    if len(set(versions)) != len(versions):
+        dupes = sorted({v for v in versions if versions.count(v) > 1})
+        flag(f"版本号有重复：{dupes} —— 同一个版本号在清单里出现两次，"
+             "「这个版本做过什么」就没有唯一答案了。运行时会拒绝这样的清单"
+             "（`upgrade.validate()`），但那时已经晚了：清单是代码，"
+             "静态就该拦住。")
+    if versions and versions[0] != baseline + 1:
+        flag(f"第一条迁移是 v{versions[0]}，而基线是 v{baseline} —— "
+             f"第一条必须是 v{baseline + 1}。")
+    if versions:
+        want = list(range(baseline + 1, baseline + 1 + len(versions)))
+        missing = sorted(set(want) - set(versions))
+        if missing:
+            flag(f"版本号不连续，缺 {missing} —— 跳号最常见的原因是"
+                 "**删掉了一条已经发布过的迁移**：那个版本号在别的机器上"
+                 "已经抬过去了，于是两台机器的 `user_version` 相同、形状不同，"
+                 "谁也看不出来。")
+
+    # 2 基线
+    if baseline != 1:
+        flag(f"BASELINE_VERSION 是 {baseline}，不是 1 —— "
+             "基线就是 `scaffold.SCHEMA` 的形状，而那个形状是 v1。")
+    for m in upgrades:
+        if m.version <= baseline:
+            flag(f"v{m.version} 的迁移落在基线（v{baseline}）或之前 —— "
+                 "基线没有「迁移」，它是**标记**：`SCHEMA` 里全是 "
+                 "`CREATE TABLE IF NOT EXISTS`，现存库就是它建的。")
+
+    # 3 名字
+    for m in upgrades:
+        if not (isinstance(m.name, str) and m.name.strip()):
+            flag(f"v{m.version} 没有名字 —— 事后翻库只能看到一个数字，"
+                 "看不出它做过什么。")
+    names = [m.name for m in upgrades]
+    if len(set(names)) != len(names):
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        flag(f"迁移名字有重复：{dupes} —— 两条不同的迁移叫一个名字，"
+             "出事时指不清是哪一条。")
+
+    # 4 版本号的写只许在 upgrade.py（测试夹具豁免）
+    for path in sorted(root.glob("*.py")):
+        if path.name == _UPGRADE_WRITER:
+            continue
+        if any(path.name.startswith(p) for p in _UPGRADE_VERSION_WRITE_EXEMPT):
+            continue
+        for n, line in code_lines(path):
+            if _UPGRADE_VERSION_WRITE.search(line):
+                hits.append((path.name, n,
+                             "抬了 `PRAGMA user_version` —— 版本号只许 "
+                             f"`{_UPGRADE_WRITER}` 一个文件写。"
+                             "两处都能抬的话，一处抬到 3、另一处以为还是 1，"
+                             "而两边都觉得自己是对的。"))
+
+    # 5 init() 真的调了 to_latest()
+    if not scaffold_path.is_file():
+        flag(f"{scaffold_path.name} 不在 —— 判据 5 没有落点。")
+    else:
+        init_fn = _ast_defs(scaffold_path).get("init")
+        if init_fn is None:
+            flag(f"`{scaffold_path.name}` 里找不到 `init()` —— "
+                 "建库入口不见了，判据 5 没法判。")
+        else:
+            called = {n.func.attr for n in ast.walk(init_fn)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+            if _UPGRADE_TO_LATEST_FN not in called:
+                flag(f"`init()` 的函数体里没有调 `{_UPGRADE_TO_LATEST_FN}()` —— "
+                     "新库建完不会被标记版本，而它**照样能用**，"
+                     "直到第一次真迁移时被当成「需要从基线重跑」。")
+
+    # 6 迁移 SQL 里没有破坏性语句
+    for m in upgrades:
+        body = (m.sql or "").upper()
+        for bad in _UPGRADE_FORBIDDEN_SQL:
+            if bad in body:
+                flag(f"v{m.version} 的 SQL 里有 `{bad}` —— P6 可逆性要求"
+                     "「supersede 而非 delete」：被它抹掉的东西，"
+                     "版本号抬上去之后找不回来。")
+
+    # 7 import 白名单
+    extra = sorted(set(_stop_imports(source_path)) - set(allowed_imports))
+    if extra:
+        flag(f"import 了 {extra}，不在白名单 {sorted(allowed_imports)} 里 —— "
+             "尤其不许 import `scaffold`：迁移要在**旧形状**上工作，"
+             "而 scaffold 的函数假设的是**新形状**。")
+
+    return hits
+
+
 def all_checks():
     """(编号, 说明, 条款, 返回命中的函数) —— **唯一的登记表**。
 
@@ -2183,6 +2382,8 @@ def all_checks():
            "§C7.1 ④ · 2026-09-29", check_the_view_layer_cannot_write_back)
     yield ("B26", "停止条件只判不执行（三张表键集相同，一句写语句都没有，阈值只经 policy.value 取）",
            "§5.4 停止条件 · 2026-09-29", check_stop_conditions_cannot_act_on_their_own)
+    yield ("B27", "schema 迁移只向前且不许把库弄坏（版本号递增连续、只一处能写、init 真的调了 to_latest、迁移里没有 DROP/DELETE）",
+           "§11.1 阻塞点 · 2026-09-29", check_upgrades_are_forward_only_and_safe)
 
 
 def main() -> int:

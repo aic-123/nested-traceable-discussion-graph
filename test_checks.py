@@ -279,9 +279,10 @@ class TestEveryCheckFires(unittest.TestCase):
         # B24 同理（它只扫 `candidates.py`）：在 TestB24Fires。
         # B25 同理（它只扫 `views.py`）：在 TestB25Fires。
         # B26 同理（它只扫 `stop.py`）：在 TestB26Fires。
+        # B27 同理（它只扫 `upgrade.py`）：在 TestB27Fires。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
                           "B16", "B17", "B18", "B19", "B20", "B21", "B22",
-                          "B23", "B24", "B25", "B26"}
+                          "B23", "B24", "B25", "B26", "B27"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -2258,6 +2259,199 @@ class TestNoResidue(unittest.TestCase):
             "豁免集合变了 —— 如果是有意的，在这里写明理由再改；"
             "如果是无意的，说明有一条检查被架空了。",
         )
+
+
+# --- B27：schema 迁移只向前 ---------------------------------------------------
+
+def _b27_probe(source: str, **kw) -> list:
+    """把 source 写成临时 `.py` 当 **B27 的源码靶**，跑完删掉。
+
+    同 `_b25_probe` / `_b26_probe`：B27 只扫 `upgrade.py` 一个文件，
+    `_scan_with_temp_py()` 喂的是 `_tmp_probe_zzz.py`，**到不了它**。
+
+    ⚠️ 探针只用来验**读源码**的那条（import 白名单）。
+    「清单形状」「版本号只许一处写」「init 有没有调 to_latest」
+    读的是传进来的参数与**别的文件**，走参数注入 ——
+    探针文件里写一份假清单不会被读到。
+    """
+    probe = ROOT / "_tmp_probe_zzz.py"
+    _clean_probes()
+    probe.write_text(source, encoding="utf-8")
+    try:
+        return checks.check_upgrades_are_forward_only_and_safe(
+            source_path=probe, **kw)
+    finally:
+        _clean_probes()
+
+
+# 一份**形状完整**的探针骨架：import 全在白名单里。
+# 这样「只报我要验的那一处」才验得准 —— 缺一处 B27 会另报一笔，
+# 把真正要验的那条淹掉。
+_UPGRADE_PROBE = (
+    "from __future__ import annotations\n"
+    "import re\n"
+    "import sqlite3\n"
+    "from typing import NamedTuple\n"
+)
+
+
+class TestB27Fires(unittest.TestCase):
+    """B27 的判据分两半：**清单的形状**（走参数注入）与**源码的形状**（走探针）。
+
+    ⚠️ 最要紧的四条：
+
+    * `test_B27_fires_when_the_checklist_has_a_duplicate_version` ——
+      重复版本号**看起来像笔误**（「同一个号写了两条」），实际跑起来是
+      **重复施加**：第二条读的是本轮的起始版本，以为库还在上一版，
+      于是同一件事再做一遍。换成 `UPDATE` 就是把数据改了两遍；
+    * `test_B27_fires_when_the_checklist_has_a_gap` ——
+      跳号最常见的原因不是笔误，是**删掉了一条已经发布过的迁移**：
+      那个版本号在别的机器上已经抬过去了，于是两台机器的 `user_version`
+      相同、形状不同，**谁也看不出来**；
+    * `test_B27_fires_when_init_forgets_to_stamp` ——
+      忘了调 `to_latest()`，新库建完**照样能用**，
+      直到第一次真迁移时被当成「需要从基线重跑」；
+    * `test_B27_does_not_fire_on_the_real_module` —— **反向判据**。
+      真模块上必须一条都不报，否则「检查会响」这件事本身没被验过
+      （手法同 `test_B25_is_quiet_on_the_real_module`）。
+    """
+
+    @staticmethod
+    def _run(source: str = _UPGRADE_PROBE, **overrides) -> list:
+        return _b27_probe(source, **overrides)
+
+    @staticmethod
+    def _m(version: int, name: str = "改点什么", sql: str = "") -> "checks.upgrade.Upgrade":
+        return checks.upgrade.Upgrade(version, name, sql)
+
+    # --- 判据 1：清单形状 ---------------------------------------------
+
+    def test_B27_fires_when_the_checklist_has_a_duplicate_version(self):
+        """★ 重复版本号 = 重复施加。"""
+        hits = self._run(upgrades=(self._m(2), self._m(2, "第二条")))
+        self.assertTrue(_said(hits, "重复"), hits)
+
+    def test_B27_fires_when_the_checklist_has_a_gap(self):
+        """★ 跳号多半是「删掉了一条已发布的迁移」。"""
+        hits = self._run(upgrades=(self._m(2), self._m(4)))
+        self.assertTrue(_said(hits, "不连续"), hits)
+
+    def test_B27_fires_when_the_checklist_is_not_sorted(self):
+        hits = self._run(upgrades=(self._m(3), self._m(2)))
+        self.assertTrue(_said(hits, "递增"), hits)
+
+    def test_B27_fires_when_the_first_migration_is_not_baseline_plus_one(self):
+        """第一条必须是 v2（基线是 v1）。"""
+        hits = self._run(upgrades=(self._m(3),))
+        self.assertTrue(_said(hits, "第一条"), hits)
+
+    # --- 判据 2：基线 --------------------------------------------------
+
+    def test_B27_fires_when_a_migration_lands_on_the_baseline(self):
+        """基线没有「迁移」——它是**标记**。"""
+        hits = self._run(upgrades=(self._m(1),), baseline=1)
+        self.assertTrue(_said(hits, "基线"), hits)
+
+    def test_B27_fires_when_the_baseline_is_not_one(self):
+        hits = self._run(upgrades=(), baseline=2)
+        self.assertTrue(_said(hits, "BASELINE_VERSION"), hits)
+
+    # --- 判据 3：名字 --------------------------------------------------
+
+    def test_B27_fires_when_a_migration_has_no_name(self):
+        """没有名字，事后翻库只能看到一个数字。"""
+        hits = self._run(upgrades=(self._m(2, "   "),))
+        self.assertTrue(_said(hits, "没有名字"), hits)
+
+    def test_B27_fires_when_two_upgrades_share_a_name(self):
+        hits = self._run(upgrades=(self._m(2, "同名"), self._m(3, "同名")))
+        self.assertTrue(_said(hits, "名字有重复"), hits)
+
+    # --- 判据 4：版本号只许一处写 ---------------------------------------
+
+    def test_B27_fires_when_another_file_raises_the_version(self):
+        """★ 两处都能抬版本号，两边都会觉得自己是对的。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            here = Path(d)
+            (here / "somewhere_else.py").write_text(
+                "import sqlite3\n\n"
+                "def bump(conn):\n"
+                '    conn.execute("PRAGMA user_version = 9")\n',
+                encoding="utf-8")
+            hits = self._run(root=here)
+            self.assertTrue(any(h[0] == "somewhere_else.py" for h in hits), hits)
+
+    def test_B27_does_not_blame_the_real_writer_when_probing(self):
+        """★ 探针场景下，真的 `upgrade.py` **不该**被当成「别的文件」——
+        它抬版本号是它的活。
+
+        这条抓出过一个真 bug：判据 4 原先按 `source_path.name` 排除，
+        而探针把 `source_path` 指到 `_tmp_probe_zzz.py`，于是真的
+        `upgrade.py` 变成了「别的文件」，**每一条探针用例都多报一笔**。
+        """
+        hits = self._run()
+        self.assertFalse(any(h[0] == "upgrade.py" for h in hits), hits)
+
+    # --- 判据 5：init() 真的调了 to_latest() ---------------------------
+
+    def test_B27_fires_when_init_forgets_to_stamp(self):
+        """★ 忘了调，新库照样能用 —— 直到第一次真迁移时被当成「从基线重跑」。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            here = Path(d)
+            fake = here / "scaffold.py"
+            fake.write_text("import sqlite3\n\n"
+                            "def init(conn):\n"
+                            "    conn.executescript(SCHEMA)\n",
+                            encoding="utf-8")
+            hits = self._run(scaffold_path=fake)
+            self.assertTrue(_said(hits, "没有调"), hits)
+
+    def test_B27_fires_when_the_build_entrypoint_is_gone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            here = Path(d)
+            fake = here / "scaffold.py"
+            fake.write_text("import sqlite3\n", encoding="utf-8")
+            hits = self._run(scaffold_path=fake)
+            self.assertTrue(_said(hits, "找不到 `init()`"), hits)
+
+    # --- 判据 6：破坏性 SQL ---------------------------------------------
+
+    def test_B27_fires_when_a_migration_drops_a_table(self):
+        """P6 可逆性：supersede 而非 delete。"""
+        hits = self._run(upgrades=(
+            self._m(2, "重建表", "DROP TABLE artifact;"),))
+        self.assertTrue(_said(hits, "DROP TABLE"), hits)
+
+    def test_B27_fires_when_a_migration_deletes_rows(self):
+        hits = self._run(upgrades=(
+            self._m(2, "清一清", "DELETE FROM artifact;"),))
+        self.assertTrue(_said(hits, "DELETE FROM"), hits)
+
+    def test_B27_is_quiet_on_an_additive_migration(self):
+        """反向：只加不删的迁移不该被报 —— 那正是允许的那一类。"""
+        hits = self._run(upgrades=(
+            self._m(2, "加一栏", "ALTER TABLE artifact ADD COLUMN x TEXT;"),))
+        self.assertEqual(hits, [])
+
+    # --- 判据 7：import 白名单 ------------------------------------------
+
+    def test_B27_fires_when_the_module_imports_scaffold(self):
+        """★ 迁移要在**旧形状**上工作，而 scaffold 的函数假设的是新形状。"""
+        hits = self._run("import scaffold\n")
+        self.assertTrue(_said(hits, "白名单"), hits)
+
+    def test_B27_fires_when_the_module_imports_upper(self):
+        hits = self._run("import upper\n")
+        self.assertTrue(_said(hits, "白名单"), hits)
+
+    # --- 反向判据 --------------------------------------------------------
+
+    def test_B27_does_not_fire_on_the_real_module(self):
+        """真模块上必须一条都不报。"""
+        self.assertEqual(checks.check_upgrades_are_forward_only_and_safe(), [])
 
 
 if __name__ == "__main__":

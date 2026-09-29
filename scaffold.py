@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 # 这样 `_append_revision()` 能在**序列化那一刻**验定位符，而不会有循环依赖。
 # 为什么必须在这一层验：`add_artifact()` 与 `revise()` 都从这里过 ——
 # 它是内容落库的**唯一漏斗**。放在这里，就没有第二条路能存进一个坏定位符。
+import upgrade
 import pointer
 
 # ---------------------------------------------------------------------------
@@ -483,8 +484,18 @@ def connect(path: str = ":memory:") -> sqlite3.Connection:
 
 
 def init(conn: sqlite3.Connection) -> None:
+    """建库到**最新版本**。
+
+    `SCHEMA` 建出来的是**基线形状**（v1）；基线之后还有迁移的话，
+    由 `upgrade.to_latest()` 接着往上跑。
+
+    新库与「迁移机制引入之前的老库」走的是同一条路 —— 两者形状相同，
+    因为 `SCHEMA` 里全是 `CREATE TABLE IF NOT EXISTS`。所以这里不需要
+    分支判断「这是新库还是老库」：`user_version` 是 0 就标记基线，是几就从几往上跑。
+    """
     conn.executescript(SCHEMA)
     conn.commit()
+    upgrade.to_latest(conn)
 
 
 # ---------------------------------------------------------------------------
