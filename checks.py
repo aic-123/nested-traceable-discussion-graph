@@ -33,11 +33,11 @@ import tokenize
 from functools import partial
 from pathlib import Path
 
-# ⚠️ 本文件**只有十条检查** import 了被检查的模块（B16–B24），其余全是纯静态扫源码。
+# ⚠️ 本文件**只有十一条检查** import 了被检查的模块（B16–B25），其余全是纯静态扫源码。
 # 理由：那几条查的是**词汇表定义的自洽性** —— 那是「规格」，读常量就是读规格，
 # 比用正则去抠源码里的字面量准得多（正则抠字面量改个格式就失效）。
 # 它们不引入运行时依赖：`candidates` / `contribute` / `pointer` / `scaffold` /
-# `staging` / `rules` / `upper` 都是本地模块，且只用标准库。
+# `staging` / `rules` / `upper` / `views` 都是本地模块，且只用标准库。
 import candidates
 import contribute
 import pointer
@@ -45,6 +45,7 @@ import rules
 import scaffold
 import staging
 import upper
+import views
 
 from _console import force_utf8
 
@@ -1568,6 +1569,7 @@ def check_candidates_cannot_make_themselves_true(
     state: str | None = None, routes: tuple | None = None,
     route_names: dict | None = None, forbidden: tuple | None = None,
     counted: tuple | None = None, relation_states: tuple | None = None,
+    origin_prefixes: tuple | None = None,
 ) -> list[tuple[str, int, str]]:
     """候选关系不许把自己变成算数的（阶段 5b 出口判据 ①）。
 
@@ -1596,10 +1598,15 @@ def check_candidates_cannot_make_themselves_true(
     4. `promote()` 存在；签名里**没有** `FORBIDDEN_PARAMS`；`PROMOTE_ROUTES`
        的每一个都**存在且带默认值**（两条通路都必须是可选的，
        「恰好一条」才判得出来）；`PROMOTE_ROUTE_NAMES` 与 `PROMOTE_ROUTES` 同集。
-    5. ★ import 白名单只有 `__future__` / `sqlite3` / `rules` / `scaffold` ——
+    5. ★ `ORIGIN_PREFIXES` 是一组**封闭**前缀（非空、每个形如 `ai:`），
+       且 `record()` 的**函数体里真的调了** `origin_class()`。
+       签名要求 `origin` 只保证「填了」，这一条才保证「填得对」——
+       少了它，库里又会回到「`gpt` 和 `alice` 长得一样」，而 5b 的全部意义
+       就是「机器提议、人来提拔」。
+    6. ★ import 白名单只有 `__future__` / `sqlite3` / `rules` / `scaffold` ——
        **尤其不许 import `upper`**。候选层只提议底层边；归组是上层的独占权限
        （B19 钉着「上层边只有一条」）。这是单向性在候选层的落点（B14 的邻居）。
-    6. 源码级（**看 token**）：全文没有模型入口名。
+    7. 源码级（**看 token**）：全文没有模型入口名。
        本模块**不许**自己调模型 —— 「AI 建议候选」那一步在应用层，
        核心层只负责**接收**它送来的结果。
 
@@ -1622,6 +1629,8 @@ def check_candidates_cannot_make_themselves_true(
     counted = (scaffold.COUNTED_RELATION_STATES if counted is None else counted)
     relation_states = (scaffold.RELATION_STATES if relation_states is None
                        else relation_states)
+    prefixes = (candidates.ORIGIN_PREFIXES if origin_prefixes is None
+                else origin_prefixes)
 
     hits: list[tuple[str, int, str]] = []
 
@@ -1710,7 +1719,32 @@ def check_candidates_cannot_make_themselves_true(
                  "前者说「有几条路」，后者说「路上记什么名字」，"
                  "分叉之后 `event` 里会出现一条没人认得的路。")
 
-    # 5 import 白名单
+    # 5 `origin` 的词表（阶段 5b 补 · 2026-09-29 · 工程稿 §11.5）
+    #
+    # 这一条补的是判据 3 管不到的那一半：签名要求 `origin`，只保证**填了**；
+    # 「填得对」要另有一条判据，否则自由文本里写 `gpt` 和写 `alice`
+    # 在库里长得一样。
+    if not prefixes:
+        flag("ORIGIN_PREFIXES 是空的 —— 那 `origin` 就退化成自由文本，"
+             "一条候选边「是人提的还是机器提的」在库里长得一样。")
+    for p in prefixes:
+        if not (isinstance(p, str) and len(p) > 1
+                and p.endswith(candidates.ORIGIN_SEPARATOR)):
+            flag(f"ORIGIN_PREFIXES 里的 {p!r} 不是一个前缀 —— "
+                 f"要形如 'ai{candidates.ORIGIN_SEPARATOR}'。"
+                 "判前缀用的是 `startswith`，形状不对就会漏判或误判，"
+                 "而两种都看不出来。")
+    if rec is not None:
+        called = {n.func.id for n in ast.walk(rec)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if "origin_class" not in called:
+            flag("record() 的**函数体里没有调** `origin_class()` —— "
+                 "那 `origin` 就只保证「填了」，不保证「填得对」。"
+                 "必填 ≠ 填得对，这正是工程稿 §11.5 要补的那一件事："
+                 "签名照样要求 `origin`，而库里又回到「`gpt` 和 `alice` "
+                 "长得一样」。")
+
+    # 6 import 白名单
     for top in _imported_tops(source_path):
         if top not in _CAND_IMPORT_WHITELIST:
             flag(f"import 了 {top!r} —— 候选层的 import 白名单只有 "
@@ -1718,12 +1752,181 @@ def check_candidates_cannot_make_themselves_true(
                  "**尤其不许 import upper**：候选层只提议底层边，"
                  "归组是 `upper.py` 的独占权限（B19 钉着「上层边只有一条」）。")
 
-    # 6 模型入口（**看 token**，用 `search` 不用 `match` —— 理由见 B22 口径修订二）
+    # 7 模型入口（**看 token**，用 `search` 不用 `match` —— 理由见 B22 口径修订二）
     for tok in _tokens_in(source_path):
         if tok.type == tokenize.NAME and _MODEL_ENTRY_NAMES.search(tok.string):
             flag(f"出现模型入口 {tok.string!r} —— 候选层不许自己调模型。"
                  "「AI 建议候选」那一步在应用层，核心层只负责**接收**"
                  "它送来的结果。", tok.start[0])
+    return hits
+
+
+# --- B25（阶段 6 物化视图）用的常量 -------------------------------------------
+
+# 一条写语句的目标表。**判据 1 就是拿它比 `VIEW_TABLE`。**
+_VIEW_WRITE = re.compile(
+    r"\b(?:UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE)
+
+# 视图层**允许调用**的 `scaffold.*` —— 只有只读的两个。
+#
+# ⚠️ 白名单，不是黑名单。黑名单（列出 `add_artifact` / `activate` / ...）会漏掉
+# 将来新增的写函数；白名单是**新函数默认被挡住**。
+# 手法同 `pointer.SELECTOR_FIELDS`：把「不许」写成「只有这些」。
+_VIEW_READ_ONLY_SCAFFOLD = ("now", "get")
+
+# 判据 ② 必须**每次重建都跑**，不能只在测试里。这两个函数体里都要调它。
+_VIEW_GUARD = "_lower_must_not_move"
+
+
+def _view_columns(schema_text: str, table: str) -> list[str] | None:
+    """从建表语句里抠出**列名**。表级约束（`UNIQUE (...)`）不算列。
+
+    ⚠️ 不能直接按 `,` 切：`UNIQUE (view, position)` 自己就带一个逗号，
+    切完会多出一个叫 `position)` 的「列」—— 于是白名单判据**永远**报一笔假命中，
+    而那条报错读起来完全合理。
+
+    ⚠️ 找不到那张表时返回 **`None`**，不是空列表：
+    「schema 里没有这张表」和「这张表一列都没有」是两件事，
+    混起来会让检查在探针喂错 schema 时直接 `IndexError` ——
+    **检查崩掉比报错更糟**，报错至少还指得出问题在哪。
+    """
+    marker = f"{table} ("
+    if marker not in schema_text:
+        return None
+    body = schema_text.split(marker, 1)[1].rsplit(");", 1)[0]
+    body = re.sub(r"UNIQUE\s*\([^)]*\)", "", body)
+    return [chunk.strip().split()[0] for chunk in body.split(",")
+            if chunk.strip()]
+
+
+def _canonical_tables(schema_text: str) -> list[str]:
+    """`scaffold.SCHEMA` 里的建表清单 —— **唯一**的事实来源。"""
+    return sorted(re.findall(r"CREATE TABLE IF NOT EXISTS\s+(\w+)", schema_text))
+
+
+def check_the_view_layer_cannot_write_back(
+    *, source_path: Path | None = None,
+    view_table: str | None = None, fields: tuple | None = None,
+    lower: tuple | None = None, schema: str | None = None,
+    view_schema: str | None = None,
+    guard: str = _VIEW_GUARD,
+    read_only: tuple = _VIEW_READ_ONLY_SCAFFOLD,
+) -> list[tuple[str, int, str]]:
+    """物化视图**永不回写写模型**（阶段 6 的出口判据 ①②③）。
+
+    照抄 CQRS 的 read model。这条是本仓库里**最容易变成一句空话**的那类承诺 ——
+    「视图只是缓存」听起来不可能出错，于是没人防它；而真正的失败方式很安静：
+    重建的时候顺手记一条事件、或者干脆把正文抄一份进视图表。
+    两种都让**缓存变成了第二份真相**，而它看起来还是张缓存表。
+
+    判据：
+
+    1. ★ 源码里**每一条**写语句（`INSERT INTO` / `UPDATE` / `DELETE FROM`）
+       的目标**只能是** `VIEW_TABLE`。这是「投影永不回写写模型」的静态落点。
+    2. ★ `VIEW_TABLE` **不在** `scaffold.SCHEMA` 的建表清单里 ——
+       存储轴（Canonical / Materialized）与写权限轴是**两条正交的轴**（工程稿 §七）。
+       混进去之后，「删了就没了」和「删了零损失」就同时挂在同一张表上。
+    3. ★ `VIEW_SCHEMA` 建的列**恰好**是 `VIEW_FIELDS`（字段白名单，手法同
+       `pointer.SELECTOR_FIELDS`）。多一列 `text` / `content` / `body`，
+       就是把底层对象**复制**进来了 —— 而副本无法证明自己等于原文。
+    4. ★ `LOWER_TABLES` **恰好等于** `scaffold.SCHEMA` 的表集合。
+       少一张，那张表被视图改了也看不出来 —— 而快照是判据 ②③ 的全部依据。
+    5. ★ `rebuild()` 与 `rebuild_all()` 的**函数体里都调了** `_lower_must_not_move()`
+       —— 判据 ② 落在**运行时**（每次重建自比一次），不是只落在测试里。
+       只写签名不写调用的话，「重建不动底层」就退化成一句注释。
+    6. ★ `scaffold.*` 的调用只许是**只读**的（`now` / `get`）。
+       判据 1 只看得见**直接写 SQL**；`scaffold.record_event()` 这类**间接写**
+       它一个字都看不见 —— 而那正是最可能发生的一种（「顺手记一条事件」）。
+       两条一起才完整，分工同 B14 与 `test_upper` 那条行为用例。
+
+    ⚠️ 静态拦不住什么，说清楚（同 B14 / B18 / B20 / B22 / B23 / B24 的既有立场）：
+    它拦不住「绕开本模块，直接用 `scaffold` 写底层」—— 那本来就是允许的。
+    这条盯的是**视图层自己的形状**。
+    """
+    source_path = source_path or (ROOT / "views.py")
+    is_real = source_path.name == "views.py"
+    if is_real and not source_path.is_file():
+        return [("views.py", 1,
+                 "物化视图层不在 —— 阶段 6 的出口判据 ①②③ 都无从谈起。")]
+
+    view_table = views.VIEW_TABLE if view_table is None else view_table
+    fields = views.VIEW_FIELDS if fields is None else fields
+    lower = views.LOWER_TABLES if lower is None else lower
+    schema = scaffold.SCHEMA if schema is None else schema
+    view_schema = views.VIEW_SCHEMA if view_schema is None else view_schema
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, n: int = 1) -> None:
+        hits.append((source_path.name, n, msg))
+
+    # 1 写语句只许碰视图表
+    for n, line in code_lines(source_path):
+        for target in _VIEW_WRITE.findall(line):
+            if target != view_table:
+                flag(f"写语句的目标是 {target!r}，不是视图表 {view_table!r} —— "
+                     "视图是**纯读缓存**（CQRS read model），投影永不回写写模型。"
+                     "这条不拦的话，缓存会变成第二份真相，而它看起来还是张缓存表。",
+                     n)
+
+    # 2 视图表不许混进 canonical schema
+    canonical = _canonical_tables(schema)
+    if view_table in canonical:
+        flag(f"{view_table!r} 出现在 `scaffold.SCHEMA` 里 —— "
+             "存储轴与写权限轴是两条**正交的轴**（工程稿 §七）："
+             "canonical 的意思是「删了就没了」，视图的意思是「删了零损失」，"
+             "两句话都成立的东西不存在。")
+
+    # 3 列名白名单
+    declared = _view_columns(view_schema, view_table)
+    if declared is None:
+        flag(f"`VIEW_SCHEMA` 里找不到建表语句 {view_table!r} —— "
+             "视图表建不出来，而「找不到」和「一列都没有」是两件事。")
+    else:
+        extra = [c for c in declared if c not in fields]
+        missing = [c for c in fields if c not in declared]
+        if extra:
+            flag(f"视图表多出列 {extra} —— 白名单是 {list(fields)}。"
+                 "多一列 `text` / `content` / `body`，就是把底层对象**复制**进来了，"
+                 "而副本无法证明自己等于原文（`pointer.py` 那条理由，同一条）。")
+        if missing:
+            flag(f"视图表少了列 {missing} —— 白名单是 {list(fields)}。"
+                 "少一列会让某一类视图行存不下来，而插入时才发现。")
+
+    # 4 快照必须覆盖全部 canonical 表
+    if sorted(lower) != canonical:
+        flag(f"LOWER_TABLES 是 {sorted(lower)}，而 `scaffold.SCHEMA` 里是 "
+             f"{canonical} —— 快照是判据 ②③ 的全部依据，少一张表，"
+             "那张表被视图改了也看不出来。")
+
+    # 5 守卫必须在每次重建里跑（ast）
+    defs = _ast_defs(source_path)
+    for name in ("rebuild", "rebuild_all"):
+        node = defs.get(name)
+        if node is None:
+            flag(f"{name}() 不见了 —— 视图就没法整批重建了。")
+            continue
+        called = {n.func.id for n in ast.walk(node)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if guard not in called:
+            flag(f"{name}() 的函数体里没有调 {guard}() —— "
+                 "判据 ②「重建前后 lower 逐字段一致」就只在测试里成立，"
+                 "而它本该**每次重建都自证一次**。只写签名不写调用，"
+                 "那句话就退化成一条注释。")
+
+    # 6 只读的 scaffold 调用（ast）—— 判据 1 看不见间接写
+    for node in ast.walk(ast.parse(source_path.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if (isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name)
+                and fn.value.id == "scaffold" and fn.attr not in read_only):
+            flag(f"调了 `scaffold.{fn.attr}()` —— 视图层只许调只读的 "
+                 f"{list(read_only)}。判据 1 只看得见**直接写 SQL**，"
+                 "`scaffold.record_event()` 这类**间接写**它看不见 —— "
+                 "而「顺手记一条事件」正是最可能发生的那一种。", node.lineno)
+
     return hits
 
 
@@ -1773,6 +1976,8 @@ def all_checks():
            "§C2.5 · 2026-09-28", check_contribution_entrypoints_are_graph_free)
     yield ("B24", "候选关系不许把自己变成算数的（入口无 state，算数只有 active）",
            "§C2.5 第 3 档 · 2026-09-28", check_candidates_cannot_make_themselves_true)
+    yield ("B25", "视图层永不回写写模型（写语句只碰视图表，列名白名单，快照覆盖全表）",
+           "§C7.1 ④ · 2026-09-29", check_the_view_layer_cannot_write_back)
 
 
 def main() -> int:

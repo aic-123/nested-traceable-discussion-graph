@@ -23,10 +23,11 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | `staging.py` | The distillation **intake gate** — imported and community layers take different doors; an **explicit mapping table** for DeepRead's eight relations |
 | `contribute.py` | Entry points for the **seven contribution granularities** — the vocabulary lives in one table, and no entry signature takes a vocabulary parameter |
 | `candidates.py` | **Candidate relations** — an edge the AI proposes gets into the store but **not into any reading**. No `state` in the entry signature |
+| `views.py` | **Materialized views** — local expansion as a **pure read cache** (CQRS read model). Outside the view table it contains not a single write statement |
 | `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
-| `checks.py` | **24 falsification checks. Each one is executable**, not an adjective in a doc |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
-| `test_checks.py` | Proves those 24 checks **aren't vacuous** |
+| `checks.py` | **25 falsification checks. Each one is executable**, not an adjective in a doc |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
+| `test_checks.py` | Proves those 25 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -237,6 +238,53 @@ Nodes had it, edges did not — a historical asymmetry, not a design. B24 pins "
 
 So this layer only **accepts**: the caller says who proposed it, and a human or a rule decides whether it counts. "The AI suggests candidates" belongs to the application layer — it calls the model and hands the result in.
 
+### Who proposed it must name **which kind**
+
+The `relation` table has no `asserted_by` column, so "a human proposed this edge or a machine did" can only live in `origin` — and `origin` is free text, where `gpt` and `alice` look identical in the store. **Required ≠ correct.**
+
+The fix is not a column on `relation`: the table is created by `CREATE TABLE IF NOT EXISTS`, and this repo **has no migration machinery** — adding a column **silently fails on existing stores**, and history cannot be backfilled, so it would land as `NULL` and "required" would **collapse a second time**. Instead the **entry point** checks a closed set of prefixes:
+
+```python
+ORIGIN_PREFIXES = ("human:", "ai:", "import:")   # there is no "other"
+```
+
+`record(..., origin="ai:gpt")` ✅ · `record(..., origin="gpt")` ✗ · `record(..., origin="ai:")` ✗
+(a bare category is not attribution — it must name **which** model.)
+
+Readings never throw on rows written before the vocabulary existed; they return `None`, meaning "**cannot tell**", not "nobody proposed it" — the same rule as `observe.py`'s "cannot compute ≠ zero".
+
+## A view is a cache, not a second truth
+
+Local expansion lands as a **materialized view** table, copied from the CQRS read model: **a projection never writes back to the write model.**
+
+```python
+views.rebuild(conn, debate_id=debate)   # drop this view entirely, recompute from the lower layer
+views.rebuild_all(conn)                 # wipe the whole view table, recompute everything
+views.clear(conn)                       # drop every view — zero loss
+```
+
+All three exit criteria are **executable**:
+
+| Criterion | How it lands |
+|---|---|
+| ① a view can be **rebuilt wholesale** | It never reads its own old content — swap the rows for fakes and a rebuild must grow the right ones back |
+| ② the lower layer is **field-identical** across a rebuild | `rebuild()` compares two `snapshot()`s on **every call** and raises if they differ |
+| ③ drop every view and the lower layer **loses nothing** | `clear()` only touches the view table; the snapshot covers **every** canonical table |
+
+**A view row holds an id and a position — never body text.** Storing `text` would be storing a copy, and a copy cannot prove it equals the original (the same reason as `pointer.py`). Storing an id leaves no "resolvable but stale" state. B25 pins this with a **field whitelist**: one extra `text` / `content` / `body` column and it fires.
+
+⚠️ Criterion ② has one **direct consequence**, stated on its own: **a view never writes `event`.**
+`event` is one of the canonical tables, so "log a `view_rebuilt` on rebuild" is a closed road. Not for convenience — the criterion forces it: a view is a cache, and **a cache leaves no audit trail**. Leave one and it is no longer a pure read cache, and "zero loss on delete" stops holding (dropping the view would drop those events too).
+
+⚠️ It is **not** the upper layer's `Context`. The two axes must stay separately named:
+
+| | Materialized view | Upper induction (`Context`) |
+|---|---|---|
+| Nature | pure read cache | derived structure carrying judgement |
+| Dropped | **zero loss** | must leave a trace |
+| Rebuildable | yes (idempotent) | no (a rebuild may differ) |
+| Criterion | lower-layer snapshot unchanged | evidence edges must not be lost |
+
 ## On a young corpus it is **dormant**
 
 This is a **falsifiable prediction**, not a disclaimer:
@@ -255,7 +303,7 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 24 falsification checks
+python checks.py                      # the 25 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
 python -m unittest test_pointer       # locators: position only, never the body
 python -m unittest test_staging       # intake gate: no gate, no `active`
@@ -263,7 +311,8 @@ python -m unittest test_provenance    # provenance: AI output may not masquerade
 python -m unittest test_rules         # rule set: nothing written / conjunction ≠ disjunction
 python -m unittest test_contribute    # seven granularities, each creatable / empty store too
 python -m unittest test_candidates    # a candidate is never counted / only two routes make it count
-python -m unittest test_checks        # proves those 24 checks aren't vacuous
+python -m unittest test_views         # a view is a cache: idempotent, and it never moves the lower layer
+python -m unittest test_checks        # proves those 25 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:

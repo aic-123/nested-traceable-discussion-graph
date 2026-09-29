@@ -277,9 +277,10 @@ class TestEveryCheckFires(unittest.TestCase):
         # B23 同理（它只扫 `contribute.py`）：在 TestB23Fires ——
         # 喂 `_tmp_probe_zzz.py` 到不了它。
         # B24 同理（它只扫 `candidates.py`）：在 TestB24Fires。
+        # B25 同理（它只扫 `views.py`）：在 TestB25Fires。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
                           "B16", "B17", "B18", "B19", "B20", "B21", "B22",
-                          "B23", "B24"}
+                          "B23", "B24", "B25"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -1499,8 +1500,15 @@ def _b24_probe(source: str, **kw) -> list:
 
 # 一份**形状完整**的探针骨架：`record()` / `promote()` 都在，签名都是真的。
 # 这样「只报我要验的那一处」才验得准 —— 缺一个函数 B24 会另报一笔「找不到 xxx()」。
+#
+# ⚠️ `record()` 的**函数体里必须留着 `origin_class(origin)`**（2026-09-29 加）：
+# B24 的判据 5 查的就是这一句在不在。骨架里不写它，**每一条**用骨架的用例
+# 都会连带报一笔 —— 那会让「只报我要验的那一处」这件事失效。
 _CAND_PROBE = (
+    "def origin_class(origin):\n"
+    "    return origin\n"
     "def record(conn, *, kind, left, right, origin):\n"
+    "    origin_class(origin)\n"
     "    return None\n"
     "def promote(conn, *, relation_id, by=None, rule=None, signals=None):\n"
     "    return None\n"
@@ -1510,7 +1518,7 @@ _CAND_PROBE = (
 class TestB24Fires(unittest.TestCase):
     """B24 的判据是**候选入口层的形状**，探针扫不到 —— 注入假源码 / 假常量来验。
 
-    ⚠️ 最要紧的四条：
+    ⚠️ 最要紧的五条：
 
     * `test_B24_fires_when_the_candidate_state_is_not_a_relation_state` ——
       阶段 5b 之前**正是**这个状态：节点有 `proposed`、边没有，
@@ -1519,6 +1527,8 @@ class TestB24Fires(unittest.TestCase):
       出现 `state=` 的那一刻，入口就能写出 `active`，出口判据 ① 当场没了；
     * `test_B24_fires_when_a_counted_state_is_added` ——
       多一个算数的状态，就是多一条「机器提的边自动进读数」的通道；
+    * `test_B24_fires_when_the_entry_does_not_classify_the_origin` ——
+      **必填 ≠ 填得对**：签名要求 `origin` 只保证填了，判词表才保证填得对；
     * `test_B24_does_not_fire_on_prose_that_names_a_model` ——
       **反向判据**。写在字面量里的模型名不是模型入口。
     """
@@ -1531,6 +1541,7 @@ class TestB24Fires(unittest.TestCase):
                   "asserted_by")
     _COUNTED = ("active",)
     _RELATION_STATES = ("proposed", "active", "rejected", "superseded")
+    _ORIGIN_PREFIXES = ("human:", "ai:", "import:")
 
     @staticmethod
     def _run(source: str = _CAND_PROBE, **overrides) -> list:
@@ -1541,6 +1552,7 @@ class TestB24Fires(unittest.TestCase):
             forbidden=TestB24Fires._FORBIDDEN,
             counted=TestB24Fires._COUNTED,
             relation_states=TestB24Fires._RELATION_STATES,
+            origin_prefixes=TestB24Fires._ORIGIN_PREFIXES,
         )
         base.update(overrides)
         return _b24_probe(source, **base)
@@ -1644,6 +1656,42 @@ class TestB24Fires(unittest.TestCase):
         src = "def record(conn, *, kind, left, right, origin):\n    return None\n"
         self.assertTrue(_said(self._run(src), "promote() 不见了"))
 
+    # --- origin 的词表（工程稿 §11.5 · 2026-09-29）--------------------------
+
+    def test_B24_fires_when_the_entry_does_not_classify_the_origin(self):
+        """★ 签名要求 `origin` 只保证**填了**；这一条才保证**填得对**。
+
+        少了它，库里又回到「`gpt` 和 `alice` 长得一样」——
+        而 5b 的全部意义就是「机器提议、人来提拔」。
+        """
+        src = (
+            "def origin_class(origin):\n"
+            "    return origin\n"
+            "def record(conn, *, kind, left, right, origin):\n"
+            "    return None\n"
+            "def promote(conn, *, relation_id, by=None, rule=None, signals=None):\n"
+            "    return None\n"
+        )
+        hits = self._run(src)
+        self.assertTrue(_said(hits, "没有调"), hits)
+
+    def test_B24_fires_when_there_is_no_prefix_vocabulary(self):
+        hits = self._run(origin_prefixes=())
+        self.assertTrue(_said(hits, "ORIGIN_PREFIXES 是空的"), hits)
+
+    def test_B24_fires_when_a_prefix_is_not_a_prefix(self):
+        """判前缀用的是 `startswith` —— 形状不对会漏判或误判，两种都看不出来。"""
+        for bad in (("ai",), ("ai-",), (":",), ("ai:x",)):
+            with self.subTest(bad=bad):
+                hits = self._run(origin_prefixes=bad)
+                self.assertTrue(_said(hits, "不是一个前缀"), (bad, hits))
+
+    def test_B24_does_not_fire_on_the_real_prefix_vocabulary(self):
+        """★ **反向判据**：真形状（三个前缀 + 函数体里真的调了 `origin_class`）不报。"""
+        hits = self._run()
+        self.assertEqual(_said(hits, "ORIGIN_PREFIXES"), [])
+        self.assertEqual(_said(hits, "没有调"), [])
+
     # --- import 与模型入口 -------------------------------------------------
 
     def test_B24_fires_when_the_entry_layer_imports_the_upper_layer(self):
@@ -1693,6 +1741,226 @@ class TestB24Fires(unittest.TestCase):
     def test_B24_is_quiet_on_the_real_module(self):
         self.assertEqual(
             checks.check_candidates_cannot_make_themselves_true(), [])
+
+
+def _b25_probe(source: str, **kw) -> list:
+    """把 source 写成临时 `.py` 当 **B25 的源码靶**，跑完删掉。
+
+    同 `_b22_probe` / `_b23_probe` / `_b24_probe`：B25 只扫 `views.py` 一个文件，
+    `_scan_with_temp_py()` 喂的是 `_tmp_probe_zzz.py`，**到不了它**。
+
+    ⚠️ 探针只用来验**读源码**的那几条（写语句目标 / 守卫在不在 / 间接写）。
+    「列名白名单」「快照覆盖哪些表」「视图表在不在 canonical schema 里」
+    读的是 `views` / `scaffold` 的常量与建表语句，走参数注入 ——
+    探针文件里写一份假 schema 不会被读到。
+    """
+    probe = ROOT / "_tmp_probe_zzz.py"
+    _clean_probes()
+    probe.write_text(source, encoding="utf-8")
+    try:
+        return checks.check_the_view_layer_cannot_write_back(
+            source_path=probe, **kw)
+    finally:
+        _clean_probes()
+
+
+# 一份**形状完整**的探针骨架：两个重建入口都在，且都调了守卫。
+# 这样「只报我要验的那一处」才验得准 —— 缺一个函数 B25 会另报一笔「不见了」。
+_VIEW_PROBE = (
+    "def _lower_must_not_move(conn, before):\n"
+    "    return None\n"
+    "def rebuild(conn, *, debate_id):\n"
+    "    _lower_must_not_move(conn, {})\n"
+    "    return None\n"
+    "def rebuild_all(conn):\n"
+    "    _lower_must_not_move(conn, {})\n"
+    "    return None\n"
+    "def clear(conn):\n"
+    "    conn.execute(\"DELETE FROM materialized_view\")\n"
+    "    return 0\n"
+)
+
+
+class TestB25Fires(unittest.TestCase):
+    """B25 的判据是**视图层的形状**，探针扫不到 —— 注入假源码 / 假 schema 来验。
+
+    ⚠️ 最要紧的四条：
+
+    * `test_B25_fires_when_a_write_targets_a_lower_table` ——
+      「视图只是缓存」听起来不可能出错，于是没人防它；而失败方式很安静：
+      缓存悄悄变成了第二份真相，且它看起来还是张缓存表；
+    * `test_B25_fires_on_an_indirect_write` ——
+      判据 1 只看得见**直接写 SQL**，`scaffold.record_event()` 看不见；
+      而「顺手记一条事件」正是最可能发生的那一种；
+    * `test_B25_fires_when_the_view_table_gains_a_body_column` ——
+      多一列 `text` 就是把底层对象**复制**进来了（同 `pointer.py` 那条理由）；
+    * `test_the_column_parser_ignores_table_level_constraints` ——
+      **反向判据**。`UNIQUE (view, position)` 自己带一个逗号，按逗号硬切
+      会多出一个叫 `position)` 的「列」，于是白名单判据永远报一笔假命中。
+    """
+
+    @staticmethod
+    def _run(source: str = _VIEW_PROBE, **overrides) -> list:
+        return _b25_probe(source, **overrides)
+
+    # --- 1 写语句只许碰视图表 ---------------------------------------------
+
+    def test_B25_fires_when_a_write_targets_a_lower_table(self):
+        """★ 这是本阶段存在的**理由**：投影永不回写写模型。"""
+        src = _VIEW_PROBE + (
+            "def touch(conn):\n"
+            "    conn.execute(\"INSERT INTO artifact (id) VALUES ('x')\")\n"
+        )
+        hits = self._run(src)
+        self.assertTrue(_said(hits, "不是视图表"), hits)
+
+    def test_B25_fires_when_a_write_updates_the_lower_layer(self):
+        src = _VIEW_PROBE + (
+            "def touch(conn):\n"
+            "    conn.execute(\"UPDATE relation SET state = 'active'\")\n"
+        )
+        self.assertTrue(_said(self._run(src), "不是视图表"))
+
+    def test_B25_fires_when_a_write_deletes_from_the_lower_layer(self):
+        src = _VIEW_PROBE + (
+            "def touch(conn):\n"
+            "    conn.execute(\"DELETE FROM event\")\n"
+        )
+        self.assertTrue(_said(self._run(src), "不是视图表"))
+
+    def test_B25_does_not_fire_on_a_write_to_the_view_table(self):
+        """★ **反向判据**：写视图表本身是这条路径**唯一**该做的事。"""
+        self.assertEqual(_said(self._run(), "不是视图表"), [])
+
+    # --- 2 视图表不许混进 canonical schema --------------------------------
+
+    def test_B25_fires_when_the_view_table_is_in_the_canonical_schema(self):
+        """canonical 是「删了就没了」，视图是「删了零损失」——
+        两句话都成立的东西不存在，所以两张表必须分开建。"""
+        import scaffold as _scaffold
+        import views as _views
+        hits = self._run(
+            view_table="mv_probe",
+            view_schema=_views.VIEW_SCHEMA.replace(
+                _views.VIEW_TABLE, "mv_probe"),
+            schema=_scaffold.SCHEMA
+            + "\nCREATE TABLE IF NOT EXISTS mv_probe (x TEXT);\n")
+        self.assertTrue(_said(hits, "出现在 `scaffold.SCHEMA` 里"), hits)
+
+    def test_B25_fires_when_the_schema_does_not_build_the_view_table(self):
+        """★ 「schema 里没有这张表」和「这张表一列都没有」是两件事。
+
+        混起来会让检查在喂错 schema 时直接崩 —— **检查崩掉比报错更糟**，
+        报错至少还指得出问题在哪。实测第一版就是这样崩在 `IndexError` 上。
+        """
+        hits = self._run(view_schema="CREATE TABLE IF NOT EXISTS other (x);")
+        self.assertTrue(_said(hits, "找不到建表语句"), hits)
+
+    # --- 3 列名白名单 -----------------------------------------------------
+
+    def test_B25_fires_when_the_view_table_gains_a_body_column(self):
+        """★ 多一列 `text`，就是把底层对象**复制**进来了。"""
+        import views as _views
+        hits = self._run(view_schema=_views.VIEW_SCHEMA.replace(
+            "    version  TEXT NOT NULL,",
+            "    version  TEXT NOT NULL,\n    text     TEXT,"))
+        self.assertTrue(_said(hits, "视图表多出列"), hits)
+
+    def test_B25_fires_when_the_view_table_loses_a_column(self):
+        import views as _views
+        hits = self._run(view_schema=_views.VIEW_SCHEMA.replace(
+            "    built_at TEXT NOT NULL,\n", ""))
+        self.assertTrue(_said(hits, "视图表少了列"), hits)
+
+    def test_the_column_parser_ignores_table_level_constraints(self):
+        """★ **反向判据**：`UNIQUE (view, position)` 自己带一个逗号。
+
+        按逗号硬切会多出一个叫 `position)` 的「列」——
+        于是白名单判据**永远**报一笔假命中，而那条报错读起来完全合理。
+        """
+        import views as _views
+        got = checks._view_columns(_views.VIEW_SCHEMA, _views.VIEW_TABLE)
+        self.assertEqual(tuple(got), _views.VIEW_FIELDS)
+
+    # --- 4 快照必须覆盖全部 canonical 表 ----------------------------------
+
+    def test_B25_fires_when_the_snapshot_misses_a_canonical_table(self):
+        hits = self._run(lower=("artifact", "relation"))
+        self.assertTrue(_said(hits, "快照是判据"), hits)
+
+    # --- 5 守卫必须每次重建都跑 -------------------------------------------
+
+    def test_B25_fires_when_the_guard_is_not_called(self):
+        """★ 只写签名不写调用的话，「重建不动底层」就退化成一句注释。"""
+        src = (
+            "def _lower_must_not_move(conn, before):\n"
+            "    return None\n"
+            "def rebuild(conn, *, debate_id):\n"
+            "    return None\n"
+            "def rebuild_all(conn):\n"
+            "    _lower_must_not_move(conn, {})\n"
+            "    return None\n"
+        )
+        hits = self._run(src)
+        self.assertTrue(_said(hits, "rebuild() 的函数体里没有调"), hits)
+
+    def test_B25_fires_when_rebuild_all_skips_the_guard(self):
+        src = (
+            "def _lower_must_not_move(conn, before):\n"
+            "    return None\n"
+            "def rebuild(conn, *, debate_id):\n"
+            "    _lower_must_not_move(conn, {})\n"
+            "    return None\n"
+            "def rebuild_all(conn):\n"
+            "    return None\n"
+        )
+        self.assertTrue(
+            _said(self._run(src), "rebuild_all() 的函数体里没有调"))
+
+    def test_B25_fires_when_a_rebuild_entry_is_missing(self):
+        src = "def rebuild(conn, *, debate_id):\n    return None\n"
+        hits = self._run(src)
+        self.assertTrue(_said(hits, "rebuild_all() 不见了"), hits)
+
+    # --- 6 间接写（判据 1 看不见的那种）-----------------------------------
+
+    def test_B25_fires_on_an_indirect_write(self):
+        """★ 判据 1 只看得见**直接写 SQL**；`scaffold.record_event()` 它看不见。
+
+        而「重建的时候顺手记一条事件」正是最可能发生的那一种 ——
+        它还会让判据 ② 当场不成立（`event` 是 canonical 表）。
+        """
+        src = _VIEW_PROBE + (
+            "def touch(conn):\n"
+            "    scaffold.record_event(conn, 'view_rebuilt', 'x', None, {})\n"
+        )
+        hits = self._run(src)
+        self.assertTrue(_said(hits, "只许调只读的"), hits)
+
+    def test_B25_does_not_fire_on_the_read_only_scaffold_calls(self):
+        """★ **反向判据**：`now()` / `get()` 是视图层正当的只读依赖。"""
+        src = _VIEW_PROBE + (
+            "def touch(conn, debate_id):\n"
+            "    t = scaffold.now()\n"
+            "    row = scaffold.get(conn, debate_id)\n"
+            "    return t, row\n"
+        )
+        self.assertEqual(_said(self._run(src), "只许调只读的"), [])
+
+    # --- 收尾 -------------------------------------------------------------
+
+    def test_B25_fires_when_the_view_layer_is_missing(self):
+        """视图层文件不在 —— 阶段 6 的出口判据 ①②③ 都无从谈起。
+
+        靶取一个**名字叫 `views.py` 但不存在**的路径。
+        """
+        hits = checks.check_the_view_layer_cannot_write_back(
+            source_path=ROOT / "不存在的目录" / "views.py")
+        self.assertTrue(_said(hits, "物化视图层不在"), hits)
+
+    def test_B25_is_quiet_on_the_real_module(self):
+        self.assertEqual(
+            checks.check_the_view_layer_cannot_write_back(), [])
 
 
 class TestNoResidue(unittest.TestCase):

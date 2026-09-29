@@ -4,7 +4,7 @@
 两条通路恰好一条、import 白名单）。这里拦的是静态拦不住的那半：
 **建出来之后，读数真的没变吗。**
 
---- 这个文件要证的七件事 -----------------------------------------------------
+--- 这个文件要证的八件事 -----------------------------------------------------
 
 | 要证什么 | 靠哪几条 |
 |---|---|
@@ -15,6 +15,7 @@
 | 候选边**可被否掉**，且否掉不等于推翻 | `TestACandidateIsDismissible` |
 | 规则通路**要么说清是哪条规则，要么拒绝** | `TestTheRuleRouteNamesItsRule` |
 | 候选层**不碰上层结构** | `TestItStaysBelowTheUpperLayer` |
+| 「谁提的」必须说得出是**哪一类**，没有兜底 | `TestWhoProposedItIsNamed` |
 
 ⚠️ 本文件刻意只依赖 `scaffold.py` / `candidates.py` / `rules.py` / `upper.py`
 与标准库 —— 和 `test_rules.py` / `test_contribute.py` 一个规矩：
@@ -569,6 +570,96 @@ class TestItStaysBelowTheUpperLayer(_Base):
         """静态那半在 B24；这里给一条**跑得起来**的复述，方便单独读这个文件。"""
         source = inspect.getsource(candidates)
         self.assertNotIn("import upper", source)
+
+
+# ---------------------------------------------------------------------------
+# ⑧ 谁提的必须说得出是**哪一类**（工程稿 §11.5 · 2026-09-29）
+# ---------------------------------------------------------------------------
+
+class TestWhoProposedItIsNamed(_Base):
+    """「必填」只保证**填了**，「带前缀」才保证**填得对**。
+
+    工程稿 §11.5 记的是：`relation` 表没有 `asserted_by` 栏，所以一条候选边
+    「是人提的还是机器提的」只能记在 `origin` 里 —— 而 `origin` 是自由文本，
+    写 `gpt` 和写 `alice` 在库里长得一样。这一组钉的就是那个补丁：
+    **词表在入口上，且没有兜底类别。**
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.a = self._mk("Claim", "甲")
+        self.b = self._mk("Claim", "乙")
+
+    def _record(self, origin: str) -> dict:
+        return candidates.record(self.conn, kind="related_to",
+                                 left=self.a, right=self.b, origin=origin)
+
+    def test_every_declared_prefix_is_accepted(self):
+        for prefix in candidates.ORIGIN_PREFIXES:
+            with self.subTest(prefix=prefix):
+                out = self._record(prefix + "whoever")
+                self.assertEqual(out["state"], candidates.CANDIDATE_STATE)
+
+    def test_a_bare_origin_is_refused(self):
+        """⚠️ 反向判据：`origin="bob"` **不许**悄悄通过。"""
+        with self.assertRaises(candidates.CandidateError):
+            self._record("bob")
+
+    def test_the_prefix_alone_is_not_enough(self):
+        """只有类别名不构成归因 —— 要答得出是**哪一个**模型 / 哪一个人。"""
+        for prefix in candidates.ORIGIN_PREFIXES:
+            with self.subTest(prefix=prefix):
+                with self.assertRaises(candidates.CandidateError):
+                    self._record(prefix)
+
+    def test_there_is_no_fallback_class(self):
+        """没有「其它」这一类 —— 加一个，等于给「分不出来」留了个位置。"""
+        for origin in ("", "other:x", "human", "AI:gpt", " ai:gpt", "ai-gpt"):
+            with self.subTest(origin=origin):
+                with self.assertRaises(candidates.CandidateError):
+                    candidates.origin_class(origin)
+
+    def test_the_class_matches_the_prefix(self):
+        self.assertEqual(candidates.origin_class("ai:gpt"), "ai")
+        self.assertEqual(candidates.origin_class("human:alice"), "human")
+        self.assertEqual(candidates.origin_class("import:deepread"), "import")
+
+    def test_the_reading_carries_the_class(self):
+        self._record("ai:gpt")
+        self._record("human:alice")
+        got = [p["origin_class"] for p in candidates.proposed(self.conn)]
+        self.assertEqual(got, ["ai", "human"])
+
+    def test_an_old_row_is_not_mistaken_for_having_no_proposer(self):
+        """词表是后加的，库里可能躺着 `origin="bob"` 这种老行。
+
+        读数遇到它**不许抛** —— 一抛，整个 `proposed()` 就用不了了，
+        而原因跟调用方毫无关系。也**不许**当成「没有提的人」：
+        `None` 的意思是「**分不出来**」，那是 `observe.py`「算不出 ≠ 零」
+        的同一条要求。
+        """
+        scaffold.add_relation(
+            self.conn, kind="related_to", from_id=self.a, to_id=self.b,
+            origin="bob", state=candidates.CANDIDATE_STATE)
+        out = candidates.proposed(self.conn)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["origin_class"])
+        self.assertEqual(out[0]["origin"], "bob")
+        # 而判据本身仍然拒它 —— 「读得出来」和「写得进去」是两件事。
+        with self.assertRaises(candidates.CandidateError):
+            candidates.origin_class("bob")
+
+    def test_the_boundary_the_vocabulary_does_not_cover(self):
+        """⚠️ 说清它**拦不住**什么（同 B24 末尾那条立场）。
+
+        绕开 `record()`、直接走原语层，仍然写得进一条自由文本 `origin`。
+        这是**入口级**保证，不是 schema 级 —— 那条路本来就是对所有人开着的，
+        本模块不假装它是关的。
+        """
+        rid = scaffold.add_relation(
+            self.conn, kind="related_to", from_id=self.a, to_id=self.b,
+            origin="没带前缀的一条", state=candidates.CANDIDATE_STATE)
+        self.assertEqual(self._state(rid), candidates.CANDIDATE_STATE)
 
 
 if __name__ == "__main__":

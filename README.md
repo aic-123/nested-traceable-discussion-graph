@@ -23,10 +23,11 @@
 | `staging.py` | 蒸馏**入层门** —— 导入层与社区层分开走；DeepRead 八种关系的**显式映射表** |
 | `contribute.py` | 社区贡献**七种粒度**的入口 —— 词表只在一张表里，入口签名里一个词表参数都没有 |
 | `candidates.py` | **候选关系** —— AI 提的边进得了库，**进不了读数**。入口签名里没有 `state` |
+| `views.py` | **物化视图** —— 局部展开的**纯读缓存**（CQRS read model）。除了视图表，一句写语句都没有 |
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
-| `checks.py` | **24 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 24 条检查**不是空转**的 |
+| `checks.py` | **25 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` / `test_views.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 25 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -313,6 +314,63 @@ RELATION_STATES  = ("proposed", "active", "rejected", "superseded")  边补上�
 所以这一层只提供**接收**：谁提的由调用方说，算不算数由人 / 规则定。
 「AI 建议候选」那一步在应用层 —— 它调模型，然后把结果送进来。
 
+### 谁提的必须说得出是**哪一类**
+
+`relation` 表没有 `asserted_by` 栏，所以一条候选边「是人提的还是机器提的」
+只能记在 `origin` 里 —— 而 `origin` 是自由文本，写 `gpt` 和写 `alice`
+在库里长得一样。**必填 ≠ 填得对。**
+
+补法不是在 `relation` 上加一栏：`relation` 是 `CREATE TABLE IF NOT EXISTS` 建的，
+而本仓**没有迁移机制** —— 加列对**已有的库静默失效**，历史数据回填不了只能 `NULL`，
+于是「必填」**再落空一次**。改成在**入口**上判一个封闭前缀：
+
+```python
+ORIGIN_PREFIXES = ("human:", "ai:", "import:")   # 没有「其它」这一类
+```
+
+`record(..., origin="ai:gpt")` ✅ · `record(..., origin="gpt")` ✗ · `record(..., origin="ai:")` ✗
+（只有类别名不构成归因 —— 要答得出是**哪一个**模型。）
+
+读数遇到词表之前写下的老行**不抛**，返回 `None`，意思是「**分不出来**」而不是
+「没有提的人」—— 那是 `observe.py`「算不出 ≠ 零」的同一条要求。
+
+## 视图是缓存，不是第二份真相
+
+局部展开落成一张**物化视图**表，照抄 CQRS 的 read model：**投影永不回写写模型。**
+
+```python
+views.rebuild(conn, debate_id=debate)   # 先删光该视图，再按底层重算
+views.rebuild_all(conn)                 # 把整张视图表清空，全部重算
+views.clear(conn)                       # 删光全部视图 —— 零损失
+```
+
+三条出口判据都是**可执行的**：
+
+| 判据 | 落成什么 |
+|---|---|
+| ① 视图可**整批重建** | 不看旧内容 —— 把视图行换成假的，重建之后必须长回正确的样子 |
+| ② 重建前后 lower **逐字段一致** | `rebuild()` **每次调用**都比对 `snapshot()` 前后两份，不一致就抛 |
+| ③ 删光视图 lower **一字不少** | `clear()` 只碰视图表；快照覆盖**全部** canonical 表 |
+
+**视图里只有 id 与位置，没有正文。** 存一份 `text` 进去就等于存了一份副本 ——
+而副本无法证明自己等于原文（同 `pointer.py` 那条理由）。存 id 就不会有
+「指得到但内容旧了」这一档。B25 拿**字段白名单**钉住这件事：多一列
+`text` / `content` / `body` 就报。
+
+⚠️ 判据 ② 有一个**直接后果**，单独说：**视图不写 `event`。**
+`event` 是 canonical 表之一，所以「重建时记一条 `view_rebuilt`」这条路是关着的。
+不是省事，是判据推出来的 —— 视图是缓存，**缓存不留审计轨迹**；留了它就不是纯读缓存，
+「删掉零损失」也不成立（删视图会连那些事件一起删掉）。
+
+⚠️ 它**不是**上层归纳那个 `Context`。两条轴必须分开命名：
+
+| | 物化视图 | 上层归纳（`Context`） |
+|---|---|---|
+| 性质 | 纯读缓存 | 带判断的派生结构 |
+| 删掉 | **零损失** | 要留痕 |
+| 可重建 | 是（幂等） | 否（重建结果可能不同） |
+| 判据 | 重建后 lower 快照一致 | 依据边不得丢 |
+
 ## 早期阶段它是**休眠**的
 
 这是一个**可证伪的预言**，不是免责声明：
@@ -331,7 +389,7 @@ RELATION_STATES  = ("proposed", "active", "rejected", "superseded")  边补上�
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 24 条否证检查
+python checks.py                      # 25 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
@@ -339,7 +397,8 @@ python -m unittest test_provenance    # 来源与归因：AI 产出不许伪装�
 python -m unittest test_rules         # 规则集：判定一个字都没写库 / 合取不是析取
 python -m unittest test_contribute    # 七种贡献粒度逐个可建 / 空库也能建第一条
 python -m unittest test_candidates    # 候选边不进读数 / 只有两条通路能把它变算数
-python -m unittest test_checks        # 证明那 24 条检查不是空转
+python -m unittest test_views         # 视图是缓存：重建幂等 / 重建删光都不动底层
+python -m unittest test_checks        # 证明那 25 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
