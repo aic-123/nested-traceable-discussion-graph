@@ -278,9 +278,36 @@ GATE_PENDING = "pending"
 GATE_PASSED = "passed"
 
 # Relation 状态（`§C2.4` 可拒绝 / 可修改）。
+#
+# ⚠️ 四个状态**不是一个「有效 / 无效」的开关** —— 它们答的是同一个问题
+# （这条边算不算数），但**不算数的理由各不相同**：
+#
+#   proposed     还没被确认  —— 未来可能算数（阶段 5b 的候选边）
+#   active       算数
+#   rejected     被推翻了    —— 已判定不算数
+#   superseded   被取代了    —— 有后继者替它算数
+#
+# 压成一档会丢掉「为什么不算数」，而事后追责时「还没确认」与「已被推翻」
+# 是两件完全不同的事。
+#
 # 机器产出的边默认 `active` —— 这是 `§C2.5` 的「派生标注：默认生效 + 可推翻」，
 # **不是**「默认正确」。它随时可以被 rejected，改判率就是从这里算的。
-RELATION_STATES = ("active", "rejected", "superseded")
+#
+# ⚠️ 与 `ARTIFACT_STATES` 的差别是**刻意的**，不是漏了：节点有 `proposed`，
+# 边原本没有 —— 于是「一条边在被确认之前」这种状态**根本表达不出来**，
+# 而那就是阶段 5b 之前「候选关系」落不了地的原因。2026-09-28 补上。
+RELATION_STATES = ("proposed", "active", "rejected", "superseded")
+
+# ★ 上面四个状态里，**哪些算数** —— 即进 `upper.count_signals()` 的读数。
+#
+# ⚠️ 只有 `active`。另外三个一律不算数，且理由各不相同（见上表）。
+#
+# 为什么要把「算数」单列成一张表：`count_signals()` 与 `_supporting_ids()` 里
+# 那句 `r.state = 'active'` 是一个**被抄了两遍的字面量**。抄漏一处，
+# 候选边就会悄悄进读数 —— 而库里看不出任何异常（边有 id、能查、长得正常）。
+# 那张表把「算数」变成一个有名字的声明，B24 再把它与 `RELATION_STATES`
+# 的关系钉死（两两不交、并集相等），并钉住 `CANDIDATE_STATE` 不在里面。
+COUNTED_RELATION_STATES = ("active",)
 
 # Evidence 状态（`§C12.2` 的 Evidence Status 一栏）。
 # `§C9` #3：AI 生成内容不得直接成为 verified knowledge。
@@ -391,7 +418,7 @@ CREATE TABLE IF NOT EXISTS relation (
     from_id       TEXT NOT NULL,
     to_id         TEXT NOT NULL,
     origin        TEXT NOT NULL,           -- 可追溯：这条边是谁产的
-    state         TEXT NOT NULL,           -- 可拒绝：active / rejected / superseded
+    state         TEXT NOT NULL,           -- 生命周期：proposed / active / rejected / superseded
     superseded_by INTEGER,                 -- 可修改：被哪条 relation 取代
     created_at    TEXT NOT NULL,
     FOREIGN KEY (from_id) REFERENCES artifact(id),
@@ -815,6 +842,11 @@ def add_relation(
 
     `origin` 必填且区分人 / 机器 —— `§C2.4` 的「可计量」靠它：
     「AI 判定 vs 用户改判」的比例，分子分母都从这一列来。
+
+    `state` 默认 `active`（`§C2.5` 派生标注：默认生效 + 可推翻）。
+    ⚠️ 但**候选边不要走这里**：`candidates.record()` 的签名里没有 `state`，
+    所以它写不出 `active` —— 那是阶段 5b 出口判据 ① 的落地形态。
+    这一层的默认值留给**直接写入**（人建的边、上层派生边）。
     """
     if kind not in RELATION_KINDS:
         raise ScaffoldError(f"未知关系种类：{kind}")
@@ -840,20 +872,32 @@ def reject_relation(conn: sqlite3.Connection, relation_id: int, *, by: str) -> N
 
     只改 relation 自己的状态，**不删** —— 删掉的话改判率就没法算了，
     而改判率是 `§C2.4` 明确要求计量的。
+
+    ⚠️ **`proposed` 也收**（2026-09-28，阶段 5b）。两个入口不是同一件事，
+    但它们落在同一个状态上，因为「这条边不算数了」只有一个答案：
+
+        active    → rejected   推翻一条**已经算数**的边（改判）
+        proposed  → rejected   否掉一条**还没算数**的候选边（不采纳）
+
+    两者的区别**必须留在 `event` 的 payload 里**（`was` 一栏），
+    否则 `§C2.4` 要计的那个比例会把「AI 提了一条、没人理它」
+    和「AI 判定被用户改掉」算成同一件事 —— 而它们完全不同。
     """
     row = conn.execute(
         "SELECT * FROM relation WHERE id = ?", (relation_id,)
     ).fetchone()
     if row is None:
         raise ScaffoldError(f"不存在的 relation：{relation_id}")
-    if row["state"] != "active":
-        raise ScaffoldError(f"relation {relation_id} 已是 {row['state']}")
+    if row["state"] not in ("proposed", "active"):
+        raise ScaffoldError(
+            f"relation {relation_id} 是 {row['state']}，只有 proposed / active 能被推翻。"
+        )
     conn.execute(
         "UPDATE relation SET state = 'rejected' WHERE id = ?", (relation_id,)
     )
     record_event(conn, "relation_rejected", by, row["from_id"],
                  {"relation": relation_id, "kind": row["kind"],
-                  "origin": row["origin"]})
+                  "origin": row["origin"], "was": row["state"]})
     conn.commit()
 
 

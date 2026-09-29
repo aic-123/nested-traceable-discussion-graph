@@ -22,10 +22,11 @@
 | `rules.py` | 结构规则集 —— `system validation` 的落地形态。判据只能是**已有结构量的合取**，且**没有能力写库** |
 | `staging.py` | 蒸馏**入层门** —— 导入层与社区层分开走；DeepRead 八种关系的**显式映射表** |
 | `contribute.py` | 社区贡献**七种粒度**的入口 —— 词表只在一张表里，入口签名里一个词表参数都没有 |
+| `candidates.py` | **候选关系** —— AI 提的边进得了库，**进不了读数**。入口签名里没有 `state` |
 | `policy.py` | 可变动的运维门槛（不是信号，不参与排序） |
-| `checks.py` | **23 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
-| `test_checks.py` | 证明那 23 条检查**不是空转**的 |
+| `checks.py` | **24 条**否证检查。**每一条都是可执行的**，不是文档里的形容词 |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` | 行为验证 —— 只依赖本仓库模块与标准库 |
+| `test_checks.py` | 证明那 24 条检查**不是空转**的 |
 | `DECLARATION.md` | 完整论证。`§7.1` 是双侧框架那一节，`§22` 是上层归纳的实现记录 |
 
 ## 导入的与用户说的，走两个口
@@ -254,6 +255,64 @@ B23 把它写成一条**双向**判据：
 节点照样有 id、照样能引用，只是「未确认的东西不许算数」在贡献入口上没了。
 只判单向的话，这一改一次都不会响。
 
+## 机器提的边进得了库，进不了读数
+
+阶段 5b。AI 可以提议「这两条之间有关系」，但**提议不等于算数**：
+
+```python
+r = candidates.record(conn, kind="related_to",
+                      left="claim-0001", right="claim-0002",
+                      origin="ai:gpt")        # → state='proposed'
+
+candidates.promote(conn, relation_id=r["relation"], by="alice")   # 人点头
+candidates.promote(conn, relation_id=r["relation"],
+                   rule="repeatedly_contested",
+                   signals=upper.count_signals(conn))            # 或规则推
+```
+
+`record()` 的签名里**没有 `state`** —— 不是省事，是这个入口的全部意义。
+出口判据「AI 产出只能是 candidate」的可执行形式就是
+**调用方没有地方填 `active`**（手法同 B14「没有 `conn` 就没法写库」）。
+
+`promote()` 收两条通路，**恰好一条**：两条同时给，事后就查不出这条边是人点头的
+还是规则推的（而改判率正是按这个算的）；一条都不给，那是**系统自己提拔自己**。
+`rule` 只能是一个**字符串**且必须命中 `RULES` —— 传函数、传模型输出、
+传一个没声明过的名字，全部拒绝。规则成立不了也**拒绝，不兜住**：
+兜住之后这条边和正常提拔的一模一样。
+
+**候选边不算数这件事有两处保证**，缺一不可：
+
+| | 靠什么 |
+|---|---|
+| 结构上 | 入口写不出 `active`（签名里没有 `state`） |
+| 读数上 | `COUNTED_RELATION_STATES == ("active",)` —— 算数的状态只有这一个 |
+
+`test_candidates.py` 里有一条用例**逐字比对**建候选边前后的 `count_signals()` 输出。
+
+### 这一层原先落不了地，原因在 schema 里
+
+设计稿的原语表写着 `Candidate = 同 Node，state=proposed`，但 `relation` 表的状态
+词表原先只有 `active / rejected / superseded` —— **没有 `proposed`**。
+于是「一条边在被确认之前」这种状态**根本表达不出来**：
+
+```
+ARTIFACT_STATES  = ("proposed", "active", "superseded")              节点有
+RELATION_STATES  = ("proposed", "active", "rejected", "superseded")  边补上了
+```
+
+节点有、边没有，这个不对称是历史遗留而不是设计。B24 把
+「`CANDIDATE_STATE` 真的在 `RELATION_STATES` 里」钉成判据 ——
+少了那一条，每一次 `record()` 都会在**运行时**抛。
+
+### 本模块不发明「提议」
+
+`upper.propose_clusters()` 是一个只读的结构提议函数，候选层**没有对应的那一个**。
+提议一条**边**需要一条启发式（「两条 claim 引用了同一个来源，所以也许
+`related_to`」）—— 那是**发明判据**，而判据形态已经定死在「已有结构量的合取」上。
+
+所以这一层只提供**接收**：谁提的由调用方说，算不算数由人 / 规则定。
+「AI 建议候选」那一步在应用层 —— 它调模型，然后把结果送进来。
+
 ## 早期阶段它是**休眠**的
 
 这是一个**可证伪的预言**，不是免责声明：
@@ -272,14 +331,15 @@ B23 把它写成一条**双向**判据：
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # 23 条否证检查
+python checks.py                      # 24 条否证检查
 python -m unittest test_upper         # 上层行为：单向性 / 命名归人 / 视图边界
 python -m unittest test_pointer       # 定位符：只存位置，不存正文
 python -m unittest test_staging       # 入层门：不过门就进不了 active
 python -m unittest test_provenance    # 来源与归因：AI 产出不许伪装成人
 python -m unittest test_rules         # 规则集：判定一个字都没写库 / 合取不是析取
 python -m unittest test_contribute    # 七种贡献粒度逐个可建 / 空库也能建第一条
-python -m unittest test_checks        # 证明那 23 条检查不是空转
+python -m unittest test_candidates    # 候选边不进读数 / 只有两条通路能把它变算数
+python -m unittest test_checks        # 证明那 24 条检查不是空转
 ```
 
 `checks.py` 会逐条打印结果。全过时输出：
@@ -288,7 +348,7 @@ python -m unittest test_checks        # 证明那 23 条检查不是空转
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 23 条，B1, B10, ... 无命中。
+否证检查全部通过：共 24 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` 会跳过 7 条**，输出 `OK (skipped=7)`。这是**有意**的：

@@ -22,10 +22,11 @@ This repo extracts **the upper induction layer** (plus the read/write primitives
 | `rules.py` | The structural rule set — what `system validation` actually means. Criteria are **conjunctions of existing structural counts**, and the module **has no ability to write** |
 | `staging.py` | The distillation **intake gate** — imported and community layers take different doors; an **explicit mapping table** for DeepRead's eight relations |
 | `contribute.py` | Entry points for the **seven contribution granularities** — the vocabulary lives in one table, and no entry signature takes a vocabulary parameter |
+| `candidates.py` | **Candidate relations** — an edge the AI proposes gets into the store but **not into any reading**. No `state` in the entry signature |
 | `policy.py` | Changeable operational thresholds (not signals; they never rank anything) |
-| `checks.py` | **23 falsification checks. Each one is executable**, not an adjective in a doc |
-| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
-| `test_checks.py` | Proves those 23 checks **aren't vacuous** |
+| `checks.py` | **24 falsification checks. Each one is executable**, not an adjective in a doc |
+| `test_upper.py` / `test_pointer.py` / `test_staging.py` / `test_provenance.py` / `test_rules.py` / `test_contribute.py` / `test_candidates.py` | Behavioural verification — depends only on this repo's modules and the stdlib |
+| `test_checks.py` | Proves those 24 checks **aren't vacuous** |
 | `DECLARATION.md` | The full argument. `§7.1` is the two-layer section, `§22` is the implementation record |
 
 ## What it is NOT
@@ -191,6 +192,51 @@ landing == "proposed"   ⟺   the type is one of the §C2.5 tier-2 names
 
 Two-way is necessary because the action to block is precisely **turning a must-confirm into a takes-effect-by-default**: after changing `claim`'s landing from `proposed` to `active`, nothing in the store looks wrong — the node still has an id, is still referenceable, and only "unconfirmed things do not count" has quietly gone from the entry layer. A one-way check never fires on that change.
 
+## A machine-proposed edge gets in, but does not get counted
+
+Stage 5b. The AI may propose "these two are related", but **proposing is not counting**:
+
+```python
+r = candidates.record(conn, kind="related_to",
+                      left="claim-0001", right="claim-0002",
+                      origin="ai:gpt")        # → state='proposed'
+
+candidates.promote(conn, relation_id=r["relation"], by="alice")   # a human nods
+candidates.promote(conn, relation_id=r["relation"],
+                   rule="repeatedly_contested",
+                   signals=upper.count_signals(conn))            # or a rule does
+```
+
+`record()`'s signature has **no `state`** — not for brevity, that is the whole point of the entry. The executable form of "AI output can only be a candidate" is that **the caller has nowhere to put `active`** (same move as B14, "no `conn`, no way to write").
+
+`promote()` takes two routes, **exactly one**. Give both and you can no longer tell afterwards whether a human nodded or a rule pushed — and the reversal rate is computed from exactly that. Give neither and the **system promotes itself**. `rule` can only be a **string** that must hit `RULES`: a function, a model output, an undeclared name — all refused. And a rule that does not hold is **refused, not smuggled**: a smuggled edge looks exactly like a properly promoted one.
+
+**Two things guarantee a candidate is not counted**, and both are required:
+
+| | By what |
+|---|---|
+| Structurally | the entry cannot write `active` (no `state` in the signature) |
+| At read time | `COUNTED_RELATION_STATES == ("active",)` — that is the only counted state |
+
+One test in `test_candidates.py` compares `count_signals()` **word for word** before and after recording a candidate.
+
+### This layer previously had nowhere to land, and the reason was in the schema
+
+The design doc's primitive table says `Candidate = same as Node, state=proposed`, but the `relation` state vocabulary only had `active / rejected / superseded` — **no `proposed`**. So "an edge before it is confirmed" was **not expressible at all**:
+
+```
+ARTIFACT_STATES  = ("proposed", "active", "superseded")              nodes had it
+RELATION_STATES  = ("proposed", "active", "rejected", "superseded")  edges got it
+```
+
+Nodes had it, edges did not — a historical asymmetry, not a design. B24 pins "`CANDIDATE_STATE` really is in `RELATION_STATES`": without that entry every single `record()` call throws at **run time**.
+
+### This module invents no "proposal"
+
+`upper.propose_clusters()` is a read-only structural proposer; the candidate layer has **no counterpart**. Proposing an **edge** requires a heuristic ("two claims quote the same source, so maybe `related_to`") — that is **inventing a criterion**, and the criterion shape is already fixed as "a conjunction of existing structural readings".
+
+So this layer only **accepts**: the caller says who proposed it, and a human or a rule decides whether it counts. "The AI suggests candidates" belongs to the application layer — it calls the model and hands the result in.
+
 ## On a young corpus it is **dormant**
 
 This is a **falsifiable prediction**, not a disclaimer:
@@ -209,14 +255,15 @@ And **an empty result must carry a sentence**: `upper.scan()` returns `empty_rea
 git clone https://github.com/aic-123/nested-traceable-discussion-graph.git
 cd nested-traceable-discussion-graph
 
-python checks.py                      # the 23 falsification checks
+python checks.py                      # the 24 falsification checks
 python -m unittest test_upper         # upper layer: one-way / naming / view boundary
 python -m unittest test_pointer       # locators: position only, never the body
 python -m unittest test_staging       # intake gate: no gate, no `active`
 python -m unittest test_provenance    # provenance: AI output may not masquerade as human
 python -m unittest test_rules         # rule set: nothing written / conjunction ≠ disjunction
 python -m unittest test_contribute    # seven granularities, each creatable / empty store too
-python -m unittest test_checks        # proves those 23 checks aren't vacuous
+python -m unittest test_candidates    # a candidate is never counted / only two routes make it count
+python -m unittest test_checks        # proves those 24 checks aren't vacuous
 ```
 
 `checks.py` prints each result. When everything passes:
@@ -225,7 +272,7 @@ python -m unittest test_checks        # proves those 23 checks aren't vacuous
 [B14] 上层 → 底层不许写成事实（单向性）    §C7.1 ④      过
 [B15] 上层节点不带系统生成的名字（命名归人）  §C2.0 §C7.1 ③  过
 ...
-否证检查全部通过：共 23 条，B1, B10, ... 无命中。
+否证检查全部通过：共 24 条，B1, B10, ... 无命中。
 ```
 
 > ⚠️ **`test_checks` skips 7 tests** — output is `OK (skipped=7)`. This is **intentional**:

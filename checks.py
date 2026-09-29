@@ -33,11 +33,12 @@ import tokenize
 from functools import partial
 from pathlib import Path
 
-# ⚠️ 本文件**只有九条检查** import 了被检查的模块（B16–B23），其余全是纯静态扫源码。
+# ⚠️ 本文件**只有十条检查** import 了被检查的模块（B16–B24），其余全是纯静态扫源码。
 # 理由：那几条查的是**词汇表定义的自洽性** —— 那是「规格」，读常量就是读规格，
 # 比用正则去抠源码里的字面量准得多（正则抠字面量改个格式就失效）。
-# 它们不引入运行时依赖：`contribute` / `pointer` / `scaffold` / `staging` /
-# `rules` / `upper` 都是本地模块，且只用标准库。
+# 它们不引入运行时依赖：`candidates` / `contribute` / `pointer` / `scaffold` /
+# `staging` / `rules` / `upper` 都是本地模块，且只用标准库。
+import candidates
 import contribute
 import pointer
 import rules
@@ -1088,10 +1089,16 @@ _ARITH_OPS = frozenset({
     "+=", "-=", "*=", "/=", "//=", "%=", "**=",
 })
 
-# 出现即报的名字：模型入口（promote 条件不许含模型判断）
-# 与数据库入口（判定必须**没有能力写库**）。
-# 两者都只扫 `NAME` token —— 所以写在提示语里不算，写在代码里才算。
-_RULES_MODEL_NAMES = re.compile(
+# 出现即报的名字：**模型入口**。
+#
+# 三个地方用它：B22（promote 条件的判据里）、B23（贡献入口）、B24（候选入口）。
+#
+# ⚠️ **只定义一次。** 原先 B22 与 B23 各写了一份**逐字相同**的正则 ——
+# 那种抄两遍的字面量正是本仓库一直在防的：改一处漏一处，于是
+# 「同一个词在两个检查里答案不同」，而两边都看起来正常。
+#
+# 只扫 `NAME` token —— 所以写在提示语里不算，写在代码里才算。
+_MODEL_ENTRY_NAMES = re.compile(
     r"(model|llm|embed|similar|predict|infer|neural|prompt)\w*", re.I)
 _RULES_DB_NAMES = frozenset({
     "sqlite3", "conn", "connection", "cursor", "executemany", "execute", "commit",
@@ -1173,7 +1180,7 @@ def check_promotion_condition_is_structural(
 
     --- 口径修订二：模型入口按「包含」判，不按「以它开头」判（2026-09-28，当天）----
 
-    写 B23 时发现这条的口径太窄：`_RULES_MODEL_NAMES.match()` 只认
+    写 B23 时发现这条的口径太窄：`_MODEL_ENTRY_NAMES.match()` 只认
     **名字以模型词开头**的标识符，于是
 
         call_the_model(text)      ← 漏
@@ -1309,7 +1316,7 @@ def check_promotion_condition_is_structural(
         if tok.type != tokenize.NAME:
             continue
         # ⚠️ `search` 不是 `match` —— 见下方「口径修订二」。
-        if _RULES_MODEL_NAMES.search(tok.string):
+        if _MODEL_ENTRY_NAMES.search(tok.string):
             flag("出现模型入口 —— promote 条件不许含模型判断（阶段 5 出口判据 ③）。"
                  "「模型觉得可以」读的是相似度之类的非结构量，B14 那条不变量当场就没了。",
                  tok.start[0])
@@ -1364,8 +1371,6 @@ def _imported_tops(path: Path) -> list[str]:
 
 
 _CONTRIB_IMPORT_WHITELIST = ("__future__", "sqlite3", "scaffold")
-_CONTRIB_MODEL_NAMES = re.compile(
-    r"(model|llm|embed|similar|predict|infer|neural|prompt)\w*", re.I)
 _CONTRIB_DIRECTIONS = ("to_target", "from_target", "between", None)
 # `§C2.5` 第 2 档**原文点名**的那几个：新建可被独立引用的对象必须确认。
 # 落 `proposed` 的类型必须落在这里面 —— 这一条是**刻意的硬编码**，
@@ -1373,6 +1378,13 @@ _CONTRIB_DIRECTIONS = ("to_target", "from_target", "between", None)
 # 分档一旦能自由漂，「哪几种贡献需要确认」就没有唯一答案了。
 _C25_MUST_CONFIRM = ("Topic", "Claim", "Subtopic")
 _CONTRIB_REQUIRED_FIELDS = ("type_", "relation", "direction", "state")
+
+# --- B24（阶段 5b 候选关系）用的常量 -----------------------------------------
+_CAND_IMPORT_WHITELIST = ("__future__", "sqlite3", "rules", "scaffold")
+# 「算数」的状态 —— 刻意的硬编码，理由同 B19 判据 6 与 B23 的 `_C25_MUST_CONFIRM`：
+# 多一个算数的状态，就是多一条「机器提的边自动进读数」的通道，
+# 而那是设计反转级的改动，不是顺手加一条。
+_CAND_COUNTED_STATES = ("active",)
 
 
 def check_contribution_entrypoints_are_graph_free(
@@ -1544,10 +1556,174 @@ def check_contribution_entrypoints_are_graph_free(
     # 这类写法**一次都报不出来** —— 而它们恰恰是最常见的写法。
     # 否证检查漏报是致命的（B6 的注释里写得很清楚），所以这里按「包含」判。
     for tok in _tokens_in(source_path):
-        if tok.type == tokenize.NAME and _CONTRIB_MODEL_NAMES.search(tok.string):
+        if tok.type == tokenize.NAME and _MODEL_ENTRY_NAMES.search(tok.string):
             flag(f"出现模型入口 {tok.string!r} —— 七种入口一个都不该调模型，"
                  "它们只把人的话落成结构。调模型的那一层是上层的归组，不是这一层。",
                  tok.start[0])
+    return hits
+
+
+def check_candidates_cannot_make_themselves_true(
+    *, source_path: Path | None = None,
+    state: str | None = None, routes: tuple | None = None,
+    route_names: dict | None = None, forbidden: tuple | None = None,
+    counted: tuple | None = None, relation_states: tuple | None = None,
+) -> list[tuple[str, int, str]]:
+    """候选关系不许把自己变成算数的（阶段 5b 出口判据 ①）。
+
+    出口判据 ① 原文是「**AI 产出只能是 candidate**」。这句话的**后果**是：
+    一条机器提的边进得了库，但**进不了读数**。两件事合起来才叫落地：
+
+        结构上：候选入口**没有能力**写 `active`（签名里没有 `state`）
+        读数上：`active` 是**唯一**算数的状态（`COUNTED_RELATION_STATES`）
+
+    只做前一件，候选边可能被当成 active 数进去；只做后一件，
+    入口可以随手指派状态。**两件都要。**
+
+    判据：
+
+    1. ★ `CANDIDATE_STATE` 必须**真的在** `scaffold.RELATION_STATES` 里。
+       少了这一条，`record()` **每一次调用**都会在运行时抛 `ScaffoldError`
+       —— 而那是跑起来才发现的事。阶段 5b 之前**正是**这个状态：
+       节点有 `proposed`、边没有，于是「一条边在被确认之前」根本表达不出来。
+       这条判据把那个空洞钉住，不让它悄悄回来。
+    2. ★ `COUNTED_RELATION_STATES` **恰好是 `("active",)`**，且
+       `CANDIDATE_STATE` **不在**里面。前者是刻意的硬编码（理由同 B19 判据 6
+       与 B23 的分档名单）：多一个算数的状态，就是多一条「机器提的边自动算数」
+       的通道 —— 那是设计反转级的改动，必须撞检查、留一次有记录的改动。
+    3. `record()` 存在；签名里**没有** `FORBIDDEN_PARAMS`；`origin` 必填且
+       **没有默认值**（留默认值等于给「没人提过这条边」留个位置）。
+    4. `promote()` 存在；签名里**没有** `FORBIDDEN_PARAMS`；`PROMOTE_ROUTES`
+       的每一个都**存在且带默认值**（两条通路都必须是可选的，
+       「恰好一条」才判得出来）；`PROMOTE_ROUTE_NAMES` 与 `PROMOTE_ROUTES` 同集。
+    5. ★ import 白名单只有 `__future__` / `sqlite3` / `rules` / `scaffold` ——
+       **尤其不许 import `upper`**。候选层只提议底层边；归组是上层的独占权限
+       （B19 钉着「上层边只有一条」）。这是单向性在候选层的落点（B14 的邻居）。
+    6. 源码级（**看 token**）：全文没有模型入口名。
+       本模块**不许**自己调模型 —— 「AI 建议候选」那一步在应用层，
+       核心层只负责**接收**它送来的结果。
+
+    ⚠️ 静态拦不住什么，说清楚（同 B14 / B18 / B20 / B22 / B23 的既有立场）：
+    它拦不住「有人绕开 `record()`，直接 `add_relation(state='active')`」——
+    那本来就是允许的（那是原语层）。这条盯的是**这一层自己的形状**：
+    候选入口不许有指派状态的能力。
+    """
+    source_path = source_path or (ROOT / "candidates.py")
+    is_real = source_path.name == "candidates.py"
+    if is_real and not source_path.is_file():
+        return [("candidates.py", 1,
+                 "候选关系层不在 —— 阶段 5b 的出口判据 ①②③ 都无从谈起。")]
+
+    state = candidates.CANDIDATE_STATE if state is None else state
+    routes = candidates.PROMOTE_ROUTES if routes is None else routes
+    route_names = (candidates.PROMOTE_ROUTE_NAMES if route_names is None
+                   else route_names)
+    forbidden = candidates.FORBIDDEN_PARAMS if forbidden is None else forbidden
+    counted = (scaffold.COUNTED_RELATION_STATES if counted is None else counted)
+    relation_states = (scaffold.RELATION_STATES if relation_states is None
+                       else relation_states)
+
+    hits: list[tuple[str, int, str]] = []
+
+    def flag(msg: str, n: int = 1) -> None:
+        hits.append((source_path.name, n, msg))
+
+    # 1 候选状态必须真的在词表里
+    if state not in relation_states:
+        flag(f"CANDIDATE_STATE 是 {state!r}，它不在 RELATION_STATES "
+             f"{list(relation_states)} 里 —— 少了这一条，`record()` "
+             "**每一次调用**都会在运行时抛，而那是跑起来才发现的事。"
+             "阶段 5b 之前正是这个状态：节点有 `proposed`、边没有，"
+             "于是「一条边在被确认之前」根本表达不出来。")
+
+    # 2 候选不算数，且「算数」只有 active
+    if tuple(counted) != _CAND_COUNTED_STATES:
+        flag(f"COUNTED_RELATION_STATES 是 {tuple(counted)}，"
+             f"不是 {_CAND_COUNTED_STATES} —— 「哪些状态算数」多一个，"
+             "就多一条「机器提的边自动进读数」的通道，而库里看不出任何异常"
+             "（边有 id、查得到、长得完全正常）。")
+    if state in counted:
+        flag(f"候选状态 {state!r} 被列进了 COUNTED_RELATION_STATES —— "
+             "那等于说「AI 提的边自动算数」，出口判据 ① 当场没了。")
+    unknown = sorted(set(counted) - set(relation_states))
+    if unknown:
+        flag(f"COUNTED_RELATION_STATES 里有 {unknown}，它们不是已知的关系状态 —— "
+             "算数的状态必须是真状态，否则那句 SQL 永远匹配不上，"
+             "而读数会静默变成空。")
+
+    # 3 / 4 两个签名（ast）
+    defs = _ast_defs(source_path)
+
+    def params_of(name: str) -> tuple[list[str], dict]:
+        node = defs[name]
+        pos = list(node.args.posonlyargs) + list(node.args.args)
+        kw = list(node.args.kwonlyargs)
+        defaults: dict[str, object] = {}
+        for a, d in zip(pos[-len(node.args.defaults):], node.args.defaults):
+            defaults[a.arg] = d
+        # ⚠️ `kw_defaults` 用 **`None` 本身**表示「这个参数没有默认值」——
+        # 而「默认值是 `None`」长成 `ast.Constant(value=None)`。
+        # 两者必须分开：写 `defaults[a.arg] = d` 会把**每一个必填的
+        # keyword-only 参数**都记成「带了默认值」—— 实测 B24 第一版
+        # 就是这样把 `record(..., origin)` 报成了漏。
+        for a, d in zip(kw, node.args.kw_defaults):
+            if d is not None:
+                defaults[a.arg] = d
+        return [a.arg for a in pos + kw], defaults
+
+    rec = defs.get("record")
+    if rec is None:
+        flag("record() 不见了 —— 候选边就没有入口了。")
+    else:
+        names, defaults = params_of("record")
+        clash = sorted(set(names) & set(forbidden))
+        if clash:
+            flag(f"record() 收了 {clash} —— 出现 `state=` 的那一刻，"
+                 "这个入口就能写出 `active`，出口判据 ① 当场没了，"
+                 "而它看起来还是个「候选入口」。")
+        if "origin" not in names:
+            flag("record() 没有 origin 参数 —— 一条候选边「是谁提的」"
+                 "就没地方记，而它看起来和正常的一条一模一样。")
+        elif "origin" in defaults:
+            flag("record() 的 origin 带了默认值 —— 留一个默认值等于给"
+                 "「没人提过这条边」留了个位置，而它看起来很正常。")
+
+    pro = defs.get("promote")
+    if pro is None:
+        flag("promote() 不见了 —— 候选边就永远算不了数。")
+    else:
+        names, defaults = params_of("promote")
+        clash = sorted(set(names) & set(forbidden))
+        if clash:
+            flag(f"promote() 收了 {clash} —— 那是让调用方**直接指派状态**，"
+                 "等于绕开「恰好一条通路」。")
+        for route in routes:
+            if route not in names:
+                flag(f"promote() 没有 {route!r} 参数 —— "
+                     f"通路 {list(routes)} 就少了一条。")
+            elif route not in defaults:
+                flag(f"promote() 的 {route!r} 是必填的 —— 两条通路都必须"
+                     "**可选**，否则「恰好一条」这个判据根本不成立。")
+        if set(routes) != set(route_names):
+            flag(f"PROMOTE_ROUTES {list(routes)} 与 PROMOTE_ROUTE_NAMES "
+                 f"{sorted(route_names)} 不是同一个集合 —— "
+                 "前者说「有几条路」，后者说「路上记什么名字」，"
+                 "分叉之后 `event` 里会出现一条没人认得的路。")
+
+    # 5 import 白名单
+    for top in _imported_tops(source_path):
+        if top not in _CAND_IMPORT_WHITELIST:
+            flag(f"import 了 {top!r} —— 候选层的 import 白名单只有 "
+                 f"{list(_CAND_IMPORT_WHITELIST)}。"
+                 "**尤其不许 import upper**：候选层只提议底层边，"
+                 "归组是 `upper.py` 的独占权限（B19 钉着「上层边只有一条」）。")
+
+    # 6 模型入口（**看 token**，用 `search` 不用 `match` —— 理由见 B22 口径修订二）
+    for tok in _tokens_in(source_path):
+        if tok.type == tokenize.NAME and _MODEL_ENTRY_NAMES.search(tok.string):
+            flag(f"出现模型入口 {tok.string!r} —— 候选层不许自己调模型。"
+                 "「AI 建议候选」那一步在应用层，核心层只负责**接收**"
+                 "它送来的结果。", tok.start[0])
     return hits
 
 
@@ -1595,6 +1771,8 @@ def all_checks():
            "§C2.5 第 3 档 · 2026-09-28", check_promotion_condition_is_structural)
     yield ("B23", "贡献入口不许要求调用方懂图结构（映射只在一张表里，签名无词表）",
            "§C2.5 · 2026-09-28", check_contribution_entrypoints_are_graph_free)
+    yield ("B24", "候选关系不许把自己变成算数的（入口无 state，算数只有 active）",
+           "§C2.5 第 3 档 · 2026-09-28", check_candidates_cannot_make_themselves_true)
 
 
 def main() -> int:

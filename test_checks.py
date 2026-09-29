@@ -1,4 +1,4 @@
-"""`checks.py` 自己的测试 —— 证明 B1–B23 **不是空转**。
+"""`checks.py` 自己的测试 —— 证明 B1–B24 **不是空转**。
 
 --- 为什么会有这个文件 -----------------------------------------------------
 
@@ -276,9 +276,10 @@ class TestEveryCheckFires(unittest.TestCase):
         # 由 TestB4IsScopedToTheUpperLayer 单独钉。
         # B23 同理（它只扫 `contribute.py`）：在 TestB23Fires ——
         # 喂 `_tmp_probe_zzz.py` 到不了它。
+        # B24 同理（它只扫 `candidates.py`）：在 TestB24Fires。
         needs_md_probe = {"B8", "B9", "B12", "B13", "B4", "B14", "B15",
                           "B16", "B17", "B18", "B19", "B20", "B21", "B22",
-                          "B23"}
+                          "B23", "B24"}
         probe_src = (
             "import requests\n"                      # B7
             "mutex = 1\n"                            # B1
@@ -1473,6 +1474,225 @@ class TestB23Fires(unittest.TestCase):
     def test_B23_is_quiet_on_the_real_module(self):
         self.assertEqual(
             checks.check_contribution_entrypoints_are_graph_free(), [])
+
+
+def _b24_probe(source: str, **kw) -> list:
+    """把 source 写成临时 `.py` 当 **B24 的源码靶**，跑完删掉。
+
+    与 `_b22_probe` / `_b23_probe` 同形、同理由：B24 只扫 `candidates.py`
+    一个文件，`_scan_with_temp_py()` 喂的是 `_tmp_probe_zzz.py`，**到不了它**。
+
+    ⚠️ 探针只用来验**签名 / import / 模型入口**那几条（它们读源码）。
+    「状态在不在词表里」「算数的状态是不是只有 active」读的是
+    `candidates` / `scaffold` 的常量，走参数注入 —— 探针文件里写一份假常量
+    不会被读到，写了也没用。
+    """
+    probe = ROOT / "_tmp_probe_zzz.py"
+    _clean_probes()
+    probe.write_text(source, encoding="utf-8")
+    try:
+        return checks.check_candidates_cannot_make_themselves_true(
+            source_path=probe, **kw)
+    finally:
+        _clean_probes()
+
+
+# 一份**形状完整**的探针骨架：`record()` / `promote()` 都在，签名都是真的。
+# 这样「只报我要验的那一处」才验得准 —— 缺一个函数 B24 会另报一笔「找不到 xxx()」。
+_CAND_PROBE = (
+    "def record(conn, *, kind, left, right, origin):\n"
+    "    return None\n"
+    "def promote(conn, *, relation_id, by=None, rule=None, signals=None):\n"
+    "    return None\n"
+)
+
+
+class TestB24Fires(unittest.TestCase):
+    """B24 的判据是**候选入口层的形状**，探针扫不到 —— 注入假源码 / 假常量来验。
+
+    ⚠️ 最要紧的四条：
+
+    * `test_B24_fires_when_the_candidate_state_is_not_a_relation_state` ——
+      阶段 5b 之前**正是**这个状态：节点有 `proposed`、边没有，
+      于是「一条边在被确认之前」根本表达不出来，而那是运行时才发现的；
+    * `test_B24_fires_when_the_entry_can_take_a_state` ——
+      出现 `state=` 的那一刻，入口就能写出 `active`，出口判据 ① 当场没了；
+    * `test_B24_fires_when_a_counted_state_is_added` ——
+      多一个算数的状态，就是多一条「机器提的边自动进读数」的通道；
+    * `test_B24_does_not_fire_on_prose_that_names_a_model` ——
+      **反向判据**。写在字面量里的模型名不是模型入口。
+    """
+
+    # 真实的形状原样喂进去，只改一处 —— 这样「报的是不是那一处」才验得准。
+    _STATE = "proposed"
+    _ROUTES = ("by", "rule")
+    _ROUTE_NAMES = {"by": "human", "rule": "structural_rule"}
+    _FORBIDDEN = ("state", "status", "intake", "digital_source_type",
+                  "asserted_by")
+    _COUNTED = ("active",)
+    _RELATION_STATES = ("proposed", "active", "rejected", "superseded")
+
+    @staticmethod
+    def _run(source: str = _CAND_PROBE, **overrides) -> list:
+        base = dict(
+            state=TestB24Fires._STATE,
+            routes=TestB24Fires._ROUTES,
+            route_names=TestB24Fires._ROUTE_NAMES,
+            forbidden=TestB24Fires._FORBIDDEN,
+            counted=TestB24Fires._COUNTED,
+            relation_states=TestB24Fires._RELATION_STATES,
+        )
+        base.update(overrides)
+        return _b24_probe(source, **base)
+
+    def _refuse(self, **overrides) -> list:
+        """只改**常量那几条**，源码靶用真形状。
+
+        ⚠️ 不能拿「名字叫 `candidates.py` 但不存在」的路径来验常量那几条 ——
+        那会先撞上「候选关系层不在」的早退分支，常量判据**一次都跑不到**，
+        于是「检查没响」长得像「判据不成立」。实测第一版就是这样。
+        """
+        return self._run(**overrides)
+
+    # --- 状态词表 ---------------------------------------------------------
+
+    def test_B24_fires_when_the_candidate_state_is_not_a_relation_state(self):
+        """★ 这是本阶段存在的**理由**：`proposed` 原先不在关系状态词表里。
+
+        少了这一条，`record()` 每一次调用都会在运行时抛 ——
+        而那是跑起来才发现的事。
+        """
+        hits = self._refuse(relation_states=("active", "rejected", "superseded"))
+        self.assertTrue(_said(hits, "不在 RELATION_STATES"), hits)
+
+    def test_B24_fires_when_a_counted_state_is_added(self):
+        """多一个算数的状态 = 多一条「机器提的边自动进读数」的通道。"""
+        hits = self._refuse(counted=("active", "proposed"))
+        self.assertTrue(_said(hits, "不是 ('active',)"), hits)
+
+    def test_B24_fires_when_the_candidate_state_counts(self):
+        hits = self._refuse(counted=("active", "proposed"))
+        self.assertTrue(_said(hits, "自动算数"), hits)
+
+    def test_B24_fires_when_a_counted_state_is_not_a_real_state(self):
+        hits = self._refuse(counted=("active", "published"))
+        self.assertTrue(_said(hits, "不是已知的关系状态"), hits)
+
+    # --- 两个签名 ---------------------------------------------------------
+
+    def test_B24_fires_when_the_entry_can_take_a_state(self):
+        """★ 出现 `state=` 的那一刻，这个入口就能写出 `active`。"""
+        src = (
+            "def record(conn, *, kind, left, right, origin, state=None):\n"
+            "    return None\n"
+            "def promote(conn, *, relation_id, by=None, rule=None, signals=None):\n"
+            "    return None\n"
+        )
+        self.assertTrue(_said(self._run(src), "state="))
+
+    def test_B24_fires_when_the_origin_has_a_default(self):
+        """留一个默认值等于给「没人提过这条边」留了个位置。"""
+        src = (
+            "def record(conn, *, kind, left, right, origin='anonymous'):\n"
+            "    return None\n"
+            "def promote(conn, *, relation_id, by=None, rule=None, signals=None):\n"
+            "    return None\n"
+        )
+        self.assertTrue(_said(self._run(src), "origin 带了默认值"))
+
+    def test_B24_does_not_fire_on_a_required_origin(self):
+        """★ **反向判据**：必填的 keyword-only 参数**不是**「带了默认值」。
+
+        `ast` 的 `kw_defaults` 用 `None` 本身表示「没有默认值」，
+        而「默认值是 `None`」长成 `ast.Constant(value=None)`。
+        两者混起来，会把每一个必填参数都报成漏 —— 实测第一版就是这样。
+        """
+        self.assertEqual(_said(self._run(_CAND_PROBE), "origin 带了默认值"), [])
+
+    def test_B24_fires_when_a_route_is_missing(self):
+        src = (
+            "def record(conn, *, kind, left, right, origin):\n"
+            "    return None\n"
+            "def promote(conn, *, relation_id, by=None, signals=None):\n"
+            "    return None\n"
+        )
+        self.assertTrue(_said(self._run(src), "没有 'rule' 参数"))
+
+    def test_B24_fires_when_a_route_is_required_instead_of_optional(self):
+        """两条通路都必须**可选**，否则「恰好一条」这个判据根本不成立。"""
+        src = (
+            "def record(conn, *, kind, left, right, origin):\n"
+            "    return None\n"
+            "def promote(conn, *, relation_id, by, rule=None, signals=None):\n"
+            "    return None\n"
+        )
+        self.assertTrue(_said(self._run(src), "是必填的"))
+
+    def test_B24_fires_when_a_route_has_no_name(self):
+        """「有几条路」与「路上记什么名字」分叉，`event` 里会出现没人认得的路。"""
+        hits = self._run(route_names={"by": "human"})
+        self.assertTrue(_said(hits, "不是同一个集合"), hits)
+
+    def test_B24_fires_when_the_record_entry_is_missing(self):
+        src = (
+            "def promote(conn, *, relation_id, by=None, rule=None, signals=None):\n"
+            "    return None\n"
+        )
+        self.assertTrue(_said(self._run(src), "record() 不见了"))
+
+    def test_B24_fires_when_the_promote_entry_is_missing(self):
+        src = "def record(conn, *, kind, left, right, origin):\n    return None\n"
+        self.assertTrue(_said(self._run(src), "promote() 不见了"))
+
+    # --- import 与模型入口 -------------------------------------------------
+
+    def test_B24_fires_when_the_entry_layer_imports_the_upper_layer(self):
+        """★ 单向性在候选层的落点：import 了 `upper`，
+        「AI 提的边变成上层结构」就有了一条路。
+        """
+        src = "import upper\n" + _CAND_PROBE
+        self.assertTrue(_said(self._run(src), "import upper"))
+
+    def test_B24_fires_on_an_unexpected_import(self):
+        src = "import requests\n" + _CAND_PROBE
+        self.assertTrue(_said(self._run(src), "import 了 'requests'"))
+
+    def test_B24_fires_on_a_model_entry(self):
+        src = _CAND_PROBE + "\ndef ask_llm(text):\n    return text\n"
+        self.assertTrue(_said(self._run(src), "模型入口"))
+
+    def test_B24_fires_on_a_model_entry_that_does_not_start_with_a_model_word(self):
+        """口径修订二（与 B22 / B23 同款）：`match` 只认「以模型词开头」，
+        而 `call_the_model()` / `ask_llm()` 恰恰是最常见的写法。
+        """
+        for name in ("call_the_model", "ask_llm", "score_by_similarity"):
+            with self.subTest(name=name):
+                src = _CAND_PROBE + f"\n{name}(1)\n"
+                self.assertTrue(_said(self._run(src), "模型入口"), name)
+
+    def test_B24_does_not_fire_on_prose_that_names_a_model(self):
+        """**反向判据**：写在字面量里的模型名不是模型入口。"""
+        src = _CAND_PROBE + '\nNOTE = "这条候选边是 model 提的，但本层不调它"\n'
+        self.assertEqual(_said(self._run(src), "模型入口"), [])
+
+    def test_B24_does_not_fire_on_a_future_annotation_import(self):
+        src = "from __future__ import annotations\n" + _CAND_PROBE
+        self.assertEqual(self._run(src), [])
+
+    # --- 收尾 -------------------------------------------------------------
+
+    def test_B24_fires_when_the_candidate_layer_is_missing(self):
+        """候选层文件不在 —— 阶段 5b 的出口判据 ①②③ 都无从谈起。
+
+        靶取一个**名字叫 `candidates.py` 但不存在**的路径。
+        """
+        hits = checks.check_candidates_cannot_make_themselves_true(
+            source_path=ROOT / "不存在的目录" / "candidates.py")
+        self.assertTrue(_said(hits, "候选关系层不在"), hits)
+
+    def test_B24_is_quiet_on_the_real_module(self):
+        self.assertEqual(
+            checks.check_candidates_cannot_make_themselves_true(), [])
 
 
 class TestNoResidue(unittest.TestCase):
